@@ -1,0 +1,16 @@
+# Build output (PyInstaller); release builds are published on the GitHub Releases page
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

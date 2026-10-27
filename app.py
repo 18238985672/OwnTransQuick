@@ -25,7 +25,7 @@ import pystray
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, ImageTk
 
 APP_NAME = "Own翻译"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CONFIG_APP_NAME = "NiuTransQuick"
 API_URL = "https://api.niutrans.com/NiuTransServer/translation"
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / CONFIG_APP_NAME
@@ -260,20 +260,20 @@ def get_work_area(x, y):
 
 
 def frame_offsets(window):
-    """How far the visible window frame extends beyond Tk's geometry (x, y, width, height) on each side.
+    """How far the window frame extends beyond Tk's geometry (x, y, width, height) on each side.
 
     Tk positions the outer window but sizes the client area, so the title bar and borders are extra;
     returns (left, top, right, bottom) offsets of the frame relative to x, y, x + width, y + height.
+    The borders include Windows' invisible resize margin, so the visible frame ends up slightly inside.
     """
-    x, y, width, height = window.winfo_x(), window.winfo_y(), window.winfo_width(), window.winfo_height()
-    try:
-        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-        rect = ctypes.wintypes.RECT()
-        if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) == 0:  # DWMWA_EXTENDED_FRAME_BOUNDS
-            return rect.left - x, rect.top - y, rect.right - (x + width), rect.bottom - (y + height)
-    except Exception:
-        logging.exception("Could not measure window frame")
-    return 0, 0, 0, window.winfo_rooty() - y
+    # Measured with Tk's own coordinates only. (DWM frame bounds are in physical pixels and disagree with this
+    # system-DPI-aware process on monitors with a different scale factor, which pushed the window off-screen.)
+    border = window.winfo_rootx() - window.winfo_x()  # side border (client area starts after it)
+    caption = window.winfo_rooty() - window.winfo_y()  # title bar plus top border
+    limit = 200  # Anything larger is a stale reading from a window that is not laid out yet.
+    if not (0 <= border <= limit and 0 <= caption <= limit):
+        border, caption = 8, 32
+    return 0, 0, 2 * border, caption + border
 
 
 def clamp(value, low, high):

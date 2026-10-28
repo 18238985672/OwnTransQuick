@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import ctypes.wintypes
 import datetime
+import io
 import logging
 import logging.handlers
 import webbrowser
@@ -14,7 +15,7 @@ import threading
 import time
 import tkinter as tk
 import winreg
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from functools import lru_cache
 from pathlib import Path
 from tkinter import font as tkfont
@@ -90,6 +91,7 @@ FOCUS_OUT_GRACE = 0.4
 CLIPBOARD_SKIP_FORMATS = {2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E, *range(0x200, 0x400)}
 CLIPBOARD_BACKUP_LIMIT = 32 * 1024 * 1024
 CF_UNICODETEXT = 13
+CF_DIB = 8
 
 # Color palettes for the Windows light and dark app themes.
 THEMES = {
@@ -138,6 +140,8 @@ def load_config():
         "popup_position": None,
         "popup_width": None,
         "show_kana": True,
+        # Screenshot translation draws the translation over the selected area instead of opening the popup.
+        "ocr_inplace": True,
         "max_chars": DEFAULT_MAX_CHARS,
         "always_on_top": True,
         "usage_date": datetime.date.today().isoformat(),
@@ -249,6 +253,11 @@ class OcrError(Exception):
     """Text recognition failed with a message that can be shown to the user as-is."""
 
 
+# Recognized text: one paragraph per line of `text`; each block's box is in the source image's pixels.
+OcrPage = namedtuple("OcrPage", "text blocks")
+OcrBlock = namedtuple("OcrBlock", "text box line_height")
+
+
 def ocr_image(image):
     """Recognize the text in a PIL image with the Windows OCR engine (Chinese or Japanese, chosen automatically)."""
     try:
@@ -282,23 +291,29 @@ def ocr_image(image):
         if not engines["user"]:
             raise OcrError(OCR_MISSING_LANGUAGE)
 
+    factor = scale if scale > 1 else 1
+
     def recognize(engine):
-        return asyncio.run(_recognize_async(engine, bitmap))
+        # Line boxes come back in the enlarged bitmap's pixels; map them back to the original image.
+        lines = asyncio.run(_recognize_async(engine, bitmap))
+        blocks = group_blocks([(left / factor, top / factor, right / factor, bottom / factor, text)
+                               for left, top, right, bottom, text in lines])
+        return OcrPage("\n".join(block.text for block in blocks), blocks)
 
     # Mostly Latin letters means English, which the Japanese engine reads better than the Chinese one.
     # Otherwise read with both engines: the wrong one turns text into rare characters and misread kana,
-    # so keep the result made of more common characters (8/10 vs 6/10 right on mixed samples, compared
+    # so keep the result made of more common characters (9/10 vs 6/10 right on mixed samples, compared
     # with the earlier "much kana means Japanese" rule, which took short Chinese lines for Japanese).
     if engines.get("ja"):
-        ja_text = recognize(engines["ja"])
-        letters = [ch for ch in ja_text if not ch.isspace()]
+        ja_page = recognize(engines["ja"])
+        letters = [ch for ch in ja_page.text if not ch.isspace()]
         latin = sum(ch.isascii() and ch.isalpha() for ch in letters)
-        if latin > 2 * len(KANJI_RE.findall(ja_text)):
-            return recognize(engines["en"]) if engines.get("en") else ja_text
+        if latin > 2 * len(KANJI_RE.findall(ja_page.text)):
+            return recognize(engines["en"]) if engines.get("en") else ja_page
         if not engines.get("zh"):
-            return ja_text
-        zh_text = recognize(engines["zh"])
-        return ja_text if ocr_score(ja_text, "ja") > ocr_score(zh_text, "zh") else zh_text
+            return ja_page
+        zh_page = recognize(engines["zh"])
+        return ja_page if ocr_score(ja_page.text, "ja") > ocr_score(zh_page.text, "zh") else zh_page
     if engines.get("en") and not engines.get("zh"):
         return recognize(engines["en"])
     return recognize(engines.get("zh") or engines.get("en") or engines["user"])
@@ -333,26 +348,216 @@ def is_common_char(ch, language):
 
 
 async def _recognize_async(engine, bitmap):
+    """OCR lines in reading order as (left, top, right, bottom, text)."""
     result = await engine.recognize_async(bitmap)
     lines = []
     for line in result.lines:
         rects = [word.bounding_rect for word in line.words]
-        top = min(rect.y for rect in rects)
-        bottom = max(rect.y + rect.height for rect in rects)
-        lines.append((top, bottom, CJK_GAP_RE.sub("", line.text)))
-    # Join wrapped lines back into paragraphs: no separator between Chinese/Japanese characters, a space
-    # between other words, and a line break where the vertical gap shows a new paragraph.
-    text = ""
-    for index, (top, bottom, line) in enumerate(lines):
-        if index:
-            previous_top, previous_bottom, previous = lines[index - 1]
-            height = max(bottom - top, previous_bottom - previous_top, 1)
-            if top - previous_bottom > 0.8 * height:
-                text += "\n"
-            elif not (re.search(f"[{CJK_CHARS}]$", previous) and re.match(f"[{CJK_CHARS}]", line)):
+        lines.append((min(rect.x for rect in rects), min(rect.y for rect in rects),
+                      max(rect.x + rect.width for rect in rects), max(rect.y + rect.height for rect in rects),
+                      CJK_GAP_RE.sub("", line.text)))
+    return lines
+
+
+def group_blocks(lines):
+    """Group OCR lines into paragraphs: a line continues the previous one when it sits right below it,
+    overlaps it horizontally and has a similar height (so columns, menus and headings stay separate)."""
+    groups = []
+    for line in lines:
+        left, top, right, bottom, text = line
+        if groups:
+            p_left, _p_top, p_right, p_bottom, p_text = groups[-1][-1]
+            height, previous_height = bottom - top, groups[-1][-1][3] - groups[-1][-1][1]
+            # Chinese/Japanese line boxes have a steady height, so a 20 px heading over 16 px body text is a
+            # different paragraph; Latin boxes vary with ascenders and descenders, so allow more there.
+            cjk = re.search(f"[{CJK_CHARS}]", text + p_text)
+            low, high = (0.85, 1.18) if cjk else (0.7, 1.4)
+            if (top - p_bottom <= 0.8 * max(height, previous_height)
+                    and low <= height / max(previous_height, 1) <= high
+                    and left < p_right and right > p_left):
+                groups[-1].append(line)
+                continue
+        groups.append([line])
+    blocks = []
+    for group in groups:
+        # Join wrapped lines: no separator between Chinese/Japanese characters, a space between other words.
+        text = ""
+        for _left, _top, _right, _bottom, line_text in group:
+            if text and not (re.search(f"[{CJK_CHARS}]$", text) and re.match(f"[{CJK_CHARS}]", line_text)):
                 text += " "
-        text += line
-    return text.strip()
+            text += line_text
+        box = (min(line[0] for line in group), min(line[1] for line in group),
+               max(line[2] for line in group), max(line[3] for line in group))
+        blocks.append(OcrBlock(text.strip(), box, sum(line[3] - line[1] for line in group) / len(group)))
+    return [block for block in blocks if block.text]
+
+
+# Fonts for drawing translations onto screenshots, by target language (first one installed wins).
+RENDER_FONTS = {"日本語": ("YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"), "中文": ("msyh.ttc", "simsun.ttc"),
+                "English": ("segoeui.ttf", "arial.ttf")}
+
+
+NO_LINE_START = set("、。，．,.)）」』】〕!！?？:：;；…‥・ーぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ%％")
+
+
+@lru_cache(maxsize=64)
+def render_font(language, size):
+    for name in (*RENDER_FONTS.get(language, ()), "msyh.ttc"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def font_runs(text, language, size):
+    """Split text into (part, font) runs: characters the language's font lacks (simplified Chinese in a
+    Japanese font, CJK in a Latin font) fall back to Microsoft YaHei; Pillow has no font fallback itself."""
+    def supported(ch):
+        if language == "日本語":
+            try:
+                ch.encode("cp932")
+                return True
+            except UnicodeEncodeError:
+                return False
+        return language != "English" or ord(ch) < 0x2E80
+    runs = []
+    for ch in text:
+        font = render_font(language if supported(ch) else "中文", size)
+        if runs and runs[-1][1] is font:
+            runs[-1][0] += ch
+        else:
+            runs.append([ch, font])
+    return runs
+
+
+def text_width(text, language, size):
+    return sum(font.getlength(part) for part, font in font_runs(text, language, size))
+
+
+def wrap_text(text, language, size, width):
+    """Break text into lines no wider than `width`: Chinese/Japanese anywhere, Latin words kept whole."""
+    lines, current = [], ""
+    for token in re.findall(r"\n|[A-Za-z0-9][\w'’.,!?;:%\-]*|\s+|.", text):
+        if token == "\n":
+            lines.append(current.rstrip())
+            current = ""
+            continue
+        # Closing punctuation and small kana never start a line; they may overhang the width a little.
+        if current and text_width(current + token, language, size) > width and token not in NO_LINE_START:
+            lines.append(current.rstrip())
+            current = token.lstrip()
+        else:
+            current += token
+    lines.append(current.rstrip())
+    return [line for line in lines if line] or [""]
+
+
+def render_translation(image, blocks, translations, language):
+    """Paint each paragraph's box with its background color and write the translation into it."""
+    rgb = image.convert("RGB")
+    out = rgb.copy()
+    draw = ImageDraw.Draw(out)
+    boxes = []
+    for block in blocks:
+        pad = max(2, int(block.line_height * 0.15))
+        boxes.append((max(0, int(block.box[0]) - pad), max(0, int(block.box[1]) - pad),
+                      min(rgb.width, int(block.box[2]) + pad), min(rgb.height, int(block.box[3]) + pad)))
+    for index, (block, translated) in enumerate(zip(blocks, translations)):
+        x0, y0, x1, y1 = boxes[index]
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        background = edge_color(rgb, (x0, y0, x1, y1))
+        foreground = text_color(rgb.crop((x0, y0, x1, y1)), background)
+        # OCR line boxes hug the glyphs, so their height is close to the original font size.
+        start = max(8, int(block.line_height * 0.95))
+        font, lines, line_height = fit_text(translated, language, start, x1 - x0 - 2, y1 - y0)
+        # Translations are often longer than the original (headings, buttons). If the text had to shrink or
+        # wrap onto more lines than the original, let it run to the right over plain background, up to the
+        # next paragraph on the same row.
+        original_lines = max(1, round((block.box[3] - block.box[1]) / (block.line_height * 1.4)))
+        if font.size < start or len(lines) > original_lines:
+            limit = min([box[0] for box in boxes if box[0] >= x1 and box[1] < y1 and box[3] > y0] + [rgb.width])
+            wider = limit - max(4, int(block.line_height * 0.8))  # Keep a gap before the next column.
+            if wider > x1 and is_plain(rgb, (x1, y0, wider, y1), background):
+                wide = fit_text(translated, language, start, wider - x0 - 2, y1 - y0)
+                if (wide[0].size, -len(wide[1])) > (font.size, -len(lines)):
+                    font, lines, line_height = wide
+                    x1 = max(x1, min(wider, x0 + 4 + max(int(text_width(line, language, font.size)) for line in lines)))
+        draw.rectangle((x0, y0, x1, y1), fill=background)
+        y = y0 + max(0, (y1 - y0 - len(lines) * line_height) // 2)
+        for line in lines:
+            x = x0 + 1
+            for part, part_font in font_runs(line, language, font.size):
+                draw.text((x, y), part, font=part_font, fill=foreground)
+                x += part_font.getlength(part)
+            y += line_height
+    return out
+
+
+def fit_text(text, language, start_size, width, height):
+    """Largest font size (from `start_size` down to 8) at which the wrapped text fits: (font, lines, line height)."""
+    size = start_size
+    while True:
+        font = render_font(language, size)
+        line_height = int(size * 1.3)
+        lines = wrap_text(text, language, size, width)
+        if len(lines) * line_height <= height + line_height * 0.3 or size <= 8:
+            return font, lines, line_height
+        size -= 1
+
+
+def edge_color(image, box):
+    """Most common color just outside a box: the background the text sits on."""
+    x0, y0, x1, y1 = box
+    pixels = []
+    for x in range(x0, x1, max(1, (x1 - x0) // 40)):
+        pixels += [image.getpixel((x, max(0, y0 - 1))), image.getpixel((x, min(image.height - 1, y1)))]
+    for y in range(y0, y1, max(1, (y1 - y0) // 20)):
+        pixels += [image.getpixel((max(0, x0 - 1), y)), image.getpixel((min(image.width - 1, x1), y))]
+    # Vote in coarse buckets so anti-aliasing noise does not split it, then average the winning bucket
+    # (a bucket's center would be visibly off, e.g. a faint gray box on white).
+    buckets = {}
+    for pixel in pixels:
+        buckets.setdefault(tuple(channel // 8 for channel in pixel), []).append(pixel)
+    winner = max(buckets.values(), key=len)
+    return tuple(round(sum(pixel[i] for pixel in winner) / len(winner)) for i in range(3))
+
+
+def color_distance(a, b):
+    return sum(abs(x - y) for x, y in zip(a, b))
+
+
+def sample_pixels(region, limit=20000):
+    """Up to `limit` evenly spaced pixels at full resolution (resizing would wash out thin strokes)."""
+    data = list(region.get_flattened_data() if hasattr(region, "get_flattened_data") else region.getdata())
+    return data[::max(1, len(data) // limit)]
+
+
+def text_color(region, background):
+    """The original text color (pixels far from the background), or black/white for contrast."""
+    ink = sorted((p for p in sample_pixels(region) if color_distance(p, background) > 150),
+                 key=lambda p: color_distance(p, background))
+    if len(ink) >= 5:
+        return ink[len(ink) * 3 // 4]  # Toward the most distinct end, past anti-aliased edges.
+    luminance = 0.299 * background[0] + 0.587 * background[1] + 0.114 * background[2]
+    return (20, 20, 20) if luminance > 140 else (245, 245, 245)
+
+
+def is_plain(image, box, background):
+    """Whether an area is (almost) only background, so translated text may spill into it."""
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return False
+    pixels = sample_pixels(image.crop(box), 4000)
+    return sum(color_distance(p, background) <= 40 for p in pixels) >= 0.97 * len(pixels)
+
+
+def image_to_dib(image):
+    """Image as a CF_DIB clipboard payload (a BMP file without its 14-byte file header)."""
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, "BMP")
+    return buffer.getvalue()[14:]
 
 
 def get_cursor_position():
@@ -869,6 +1074,7 @@ class TranslatorApp:
         self.hotkey_callbacks = {"hotkey": self.on_hotkey, "clipboard_hotkey": self.on_clipboard_hotkey,
                                  "ocr_hotkey": self.on_ocr_hotkey}
         self.snip_win = None
+        self.image_windows = []  # Overlay and toolbar of the current in-place screenshot translation.
         self.hotkey_manager = HotkeyManager(lambda name: self.hotkey_callbacks[name]())
         self.hotkey_error = None
         self.original_text = ""
@@ -1080,7 +1286,9 @@ class TranslatorApp:
                 return  # A click without a real drag.
             crop = shot.crop((round(box[0] * scale_x), round(box[1] * scale_y),
                               round(box[2] * scale_x), round(box[3] * scale_y)))
-            threading.Thread(target=self.ocr_worker, args=(crop,), daemon=True).start()
+            screen_box = (left + box[0], top + box[1], left + box[2], top + box[3])
+            self.show_toast("正在识别文字……")
+            threading.Thread(target=self.ocr_worker, args=(crop, screen_box), daemon=True).start()
 
         def close(_event=None):
             if win.winfo_exists():
@@ -1096,9 +1304,9 @@ class TranslatorApp:
         win.focus_force()
         win.grab_set()
 
-    def ocr_worker(self, image):
+    def ocr_worker(self, image, screen_box):
         try:
-            text = ocr_image(image)
+            page = ocr_image(image)
         except OcrError as exc:
             message = str(exc)
             self.root.after(0, lambda: self.show_toast(message))
@@ -1107,7 +1315,135 @@ class TranslatorApp:
             logging.exception("Text recognition failed")
             self.root.after(0, lambda: self.show_toast("文字识别失败，详情见日志"))
             return
-        self.root.after(0, lambda: self.capture_clipboard_and_translate(text, empty_message="没有识别到文字"))
+        if page.blocks and self.config.get("ocr_inplace", True):
+            self.root.after(0, lambda: self.start_image_translation(image, screen_box, page))
+        else:
+            self.root.after(0, lambda: self.capture_clipboard_and_translate(page.text, empty_message="没有识别到文字"))
+
+    def start_image_translation(self, image, screen_box, page):
+        """Translate every recognized paragraph and show the result drawn over the selected screen area."""
+        if not self.config.get("api_key"):
+            self.show_settings()
+            return
+        detected = detect_language(page.text)
+        target_name = other_language(detected)
+        source, target = LANGUAGES.get(detected, "auto"), LANGUAGES[target_name]
+        # Keep whole paragraphs within the per-request limit; the rest stay untranslated.
+        blocks, total = [], 0
+        for block in page.blocks:
+            if blocks and total + len(block.text) + 1 > self.max_chars():
+                break
+            blocks.append(block)
+            total += len(block.text) + 1
+        key = (source, target, "\n".join(block.text for block in blocks))
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            self.finish_image_translation(image, screen_box, page, blocks, self.cache[key].split("\n"), target_name, [])
+            return
+        self.show_toast("正在翻译……")
+        threading.Thread(target=self.image_translation_worker,
+                         args=(image, screen_box, page, blocks, key, target_name), daemon=True).start()
+
+    def image_translation_worker(self, image, screen_box, page, blocks, key, target_name):
+        source, target, joined = key
+        try:
+            # One request for all paragraphs; NiuTrans keeps line breaks, so split the answer back.
+            translated = self.request_with_retry(joined, "auto", target)
+            parts, fresh = translated.split("\n"), [(key, translated)]
+            if len(parts) != len(blocks):
+                logging.warning("Paragraph count changed in translation (%d -> %d); translating one by one",
+                                len(blocks), len(parts))
+                parts, fresh = [], []
+                for block in blocks:
+                    part = self.request_with_retry(block.text, "auto", target)
+                    parts.append(part)
+                    fresh.append(((source, target, block.text), part))
+        except TranslationError as exc:
+            message = str(exc)
+            self.root.after(0, lambda: self.show_toast(message))
+            return
+        self.root.after(0, lambda: self.finish_image_translation(image, screen_box, page, blocks, parts, target_name, fresh))
+
+    def finish_image_translation(self, image, screen_box, page, blocks, parts, target_name, fresh):
+        for key, translated in fresh:
+            self.remember_translation(key, translated)
+        rendered = render_translation(image, blocks, parts, target_name)
+        self.show_image_translation(screen_box, image, rendered, page, parts)
+
+    def show_image_translation(self, screen_box, original, rendered, page, parts):
+        """Lay the translated screenshot exactly over the selected area, with a small toolbar below it."""
+        self.close_image_translation()
+        c = self.c
+        x0, y0, x1, y1 = screen_box
+        width, height = x1 - x0, y1 - y0
+        views = {name: ImageTk.PhotoImage(image.resize((width, height), Image.LANCZOS) if image.size != (width, height) else image)
+                 for name, image in (("translated", rendered), ("original", original))}
+        overlay = tk.Toplevel(self.root)
+        overlay.overrideredirect(True)
+        overlay.attributes("-topmost", True)
+        overlay.geometry(f"{width}x{height}+{x0}+{y0}")
+        canvas = tk.Canvas(overlay, width=width, height=height, highlightthickness=1, highlightbackground=c["accent"],
+                           bd=0, cursor="hand2")
+        canvas.pack()
+        image_item = canvas.create_image(0, 0, anchor="nw", image=views["translated"])
+        overlay.views = views  # Keep the PhotoImages alive with the window.
+
+        toolbar = tk.Toplevel(self.root)
+        toolbar.overrideredirect(True)
+        toolbar.attributes("-topmost", True)
+        bar = tk.Frame(toolbar, bg=c["card"], highlightthickness=1, highlightbackground=c["border"])
+        bar.pack()
+        state = {"showing": "translated"}
+
+        def toggle(_event=None):
+            state["showing"] = "original" if state["showing"] == "translated" else "translated"
+            canvas.itemconfigure(image_item, image=views[state["showing"]])
+            toggle_button.configure(text="译图" if state["showing"] == "original" else "原图")
+
+        def copy_text():
+            self.copy_text("\n".join(parts))
+            self.show_toast("已复制译文")
+
+        def copy_image():
+            restore_clipboard(self.clipboard_hwnd, [(CF_DIB, image_to_dib(rendered))])
+            self.show_toast("已复制图片")
+
+        def open_in_window():
+            self.close_image_translation()
+            self.capture_clipboard_and_translate(page.text)
+
+        def tool(text, command, primary=False):
+            button = tk.Button(bar, text=text, command=command, font=("Microsoft YaHei UI", 9), relief="flat", bd=0,
+                               bg=c["accent"] if primary else c["card"], fg=c["on_accent"] if primary else c["plain_fg"],
+                               activebackground=c["accent_active"] if primary else c["hover"],
+                               activeforeground=c["on_accent"] if primary else c["plain_fg"],
+                               padx=self.s(10), pady=self.s(4), cursor="hand2")
+            button.pack(side="left", padx=self.s(2), pady=self.s(2))
+            return button
+
+        toggle_button = tool("原图", toggle)
+        tool("复制译文", copy_text, primary=True)
+        tool("复制图片", copy_image)
+        tool("在窗口中查看", open_in_window)
+        tool("✕", self.close_image_translation)
+        # Toolbar under the area's right edge, or above it when there is no room below.
+        toolbar.update_idletasks()
+        left, top, right, bottom = get_work_area(x1, y1)
+        bar_width, bar_height = toolbar.winfo_reqwidth(), toolbar.winfo_reqheight()
+        bar_y = y1 + self.s(6) if y1 + self.s(6) + bar_height <= bottom else y0 - self.s(6) - bar_height
+        toolbar.geometry(f"+{clamp(x1 - bar_width, left, right - bar_width)}+{clamp(bar_y, top, bottom - bar_height)}")
+
+        canvas.bind("<Button-1>", toggle)
+        for window in (overlay, toolbar):
+            window.bind("<Escape>", lambda _event: self.close_image_translation())
+        self.image_windows = [overlay, toolbar]
+        overlay.focus_force()
+
+    def close_image_translation(self):
+        for window in getattr(self, "image_windows", []):
+            if window.winfo_exists():
+                window.destroy()
+        self.image_windows = []
 
     def copy_selection_worker(self):
         try:
@@ -1234,45 +1570,57 @@ class TranslatorApp:
     def translate_worker(self, request_id, key, target_name, source):
         """`key` is the cache key; `source` is what the API gets ("auto" stays "auto")."""
         _cache_source, target, text = key
+        try:
+            translated = self.request_with_retry(
+                text, source, target, on_retry=lambda: self.root.after(0, lambda: self.set_status(request_id, "请求失败，正在重试……")))
+        except TranslationError as exc:
+            message = str(exc)
+            self.root.after(0, lambda: self.finish_translation(request_id, key, message, target_name, is_error=True))
+            return
+        self.root.after(0, lambda: self.finish_translation(request_id, key, translated, target_name))
+
+    def request_with_retry(self, text, source, target, on_retry=None):
+        """request_translation, retried once after RETRY_DELAY unless it timed out (a timeout already waited
+        the full REQUEST_TIMEOUT). Runs on a worker thread; raises the last TranslationError."""
         for attempt in range(2):
             try:
-                translated = request_translation(self.config.get("api_key", ""), text, source, target)
-                self.root.after(0, lambda: self.finish_translation(request_id, key, translated, target_name))
-                return
+                return request_translation(self.config.get("api_key", ""), text, source, target)
             except TranslationError as exc:
-                # Timeouts already waited the full REQUEST_TIMEOUT, so only other failures get one retry.
                 logging.warning("Translation attempt %d failed (%s -> %s): %s", attempt + 1, source, target, exc)
                 if attempt == 0 and not isinstance(exc, TranslationTimeout):
-                    self.root.after(0, lambda: self.set_status(request_id, "请求失败，正在重试……"))
+                    if on_retry:
+                        on_retry()
                     time.sleep(RETRY_DELAY)
                     continue
-                message = str(exc)
-                self.root.after(0, lambda: self.finish_translation(request_id, key, message, target_name, is_error=True))
-                return
+                raise
 
     def set_status(self, request_id, text):
         if request_id == self.request_id and self.status_label and self.status_label.winfo_exists():
             self.status_label.configure(text=text)
 
+    def remember_translation(self, key, translated):
+        """Cache a fresh API result (both directions) and add it to today's character count."""
+        source, target, text = key
+        self.cache[key] = translated
+        self.cache.move_to_end(key)
+        # Also remember the opposite direction, so swapping languages afterwards needs no request.
+        reverse = (target, source, translated)
+        if source != "auto" and source != target and reverse not in self.cache:
+            self.cache[reverse] = text
+        while len(self.cache) > CACHE_SIZE:
+            self.cache.popitem(last=False)
+        # Cached results cost no API credits, so only fresh results are counted.
+        today = datetime.date.today().isoformat()
+        if self.config.get("usage_date") != today:
+            self.config["usage_date"] = today
+            self.config["today_translated_chars"] = 0
+        self.config["today_translated_chars"] = int(self.config.get("today_translated_chars", 0)) + len(text)
+        save_config(self.config)
+        self.refresh_settings_usage()
+
     def finish_translation(self, request_id, key, translated, target_name, is_error=False, from_cache=False):
         if not is_error and not from_cache:
-            source, target, text = key
-            self.cache[key] = translated
-            self.cache.move_to_end(key)
-            # Also remember the opposite direction, so swapping languages afterwards needs no request.
-            reverse = (target, source, translated)
-            if source != "auto" and source != target and reverse not in self.cache:
-                self.cache[reverse] = text
-            while len(self.cache) > CACHE_SIZE:
-                self.cache.popitem(last=False)
-            # Cached results cost no API credits, so only fresh results are counted.
-            today = datetime.date.today().isoformat()
-            if self.config.get("usage_date") != today:
-                self.config["usage_date"] = today
-                self.config["today_translated_chars"] = 0
-            self.config["today_translated_chars"] = int(self.config.get("today_translated_chars", 0)) + len(key[2])
-            save_config(self.config)
-            self.refresh_settings_usage()
+            self.remember_translation(key, translated)
         # Ignore stale results if a newer translation was started while this request was running.
         if request_id != self.request_id:
             return
@@ -1939,6 +2287,9 @@ class TranslatorApp:
         kana_var = tk.BooleanVar(value=bool(self.config.get("show_kana", True)))
         option_row(translate_card, "日文译文显示假名读音", "在译文下方以小字显示整句的假名读音，复制译文时不包含读音",
                    lambda parent: toggle(parent, kana_var))
+        inplace_var = tk.BooleanVar(value=bool(self.config.get("ocr_inplace", True)))
+        option_row(translate_card, "截图翻译直接显示在图上", "像谷歌翻译那样把译文画在截图的原位置；关闭后在翻译窗口中显示",
+                   lambda parent: toggle(parent, inplace_var))
 
         # 统计
         page = nav_item("统计", "")
@@ -2017,6 +2368,7 @@ class TranslatorApp:
             self.config["close_after_copy"] = close_var.get()
             self.config["close_on_click_outside"] = outside_var.get()
             self.config["show_kana"] = kana_var.get()
+            self.config["ocr_inplace"] = inplace_var.get()
             self.config["max_chars"] = max_chars
             save_config(self.config)
             # The popup's "N / limit 字" counter otherwise keeps the old limit until the text changes.

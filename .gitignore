@@ -17,3 +17,4 @@ desktop.ini
 
 # Local files that must never be committed
 other/
+.claude/settings.local.json

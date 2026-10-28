@@ -14,3 +14,6 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Local files that must never be committed
+other/

@@ -39,8 +39,8 @@ DEFAULT_HOTKEYS = {"hotkey": "ctrl+alt+1", "clipboard_hotkey": "ctrl+alt+2", "oc
 # Chinese/Japanese characters and full-width punctuation; Windows OCR puts spaces between them.
 CJK_CHARS = "　-〿぀-ヿ㐀-䶿一-鿿＀-￯"
 CJK_GAP_RE = re.compile(f"(?<=[{CJK_CHARS}]) (?=[{CJK_CHARS}])")
-# Share of kana in the Japanese engine's result above which the text is taken as Japanese.
-OCR_KANA_RATIO = 0.15
+# Katakana the Japanese OCR engine produces when it misreads Chinese characters (カ/力, ー/一, エ/工, ロ/口 ...).
+LOOKALIKE_KATAKANA = set("カエロニハトタヒームオ")
 OCR_MISSING_LANGUAGE = "系统没有可用的文字识别语言。请在“设置 → 时间和语言 → 语言和区域”中添加中文或日语，并安装“光学字符识别”。"
 # NiuTrans text translation accepts at most this many characters per request.
 NIUTRANS_MAX_CHARS = 5000
@@ -55,6 +55,7 @@ NIUTRANS_ERRORS = {
     "13002": "还没有填写 API Key。",
     "13003": "原文内容未通过小牛翻译的内容审核。",
     "13007": "小牛翻译不支持这个语言方向。",
+    "13005": "原文语言和目标语言相同，请换一个目标语言。",
     "13008": "小牛翻译处理超时，请稍后再试。",
 }
 # Seconds to wait for a translation response; other failures are retried once after a short pause.
@@ -284,24 +285,51 @@ def ocr_image(image):
     def recognize(engine):
         return asyncio.run(_recognize_async(engine, bitmap))
 
-    # The wrong engine produces garbage, so read with the Japanese engine first and pick by content:
-    # real Japanese is full of kana; mostly Latin letters means English, which the Japanese engine reads
-    # better than the Chinese one; anything else is Chinese.
+    # Mostly Latin letters means English, which the Japanese engine reads better than the Chinese one.
+    # Otherwise read with both engines: the wrong one turns text into rare characters and misread kana,
+    # so keep the result made of more common characters (8/10 vs 6/10 right on mixed samples, compared
+    # with the earlier "much kana means Japanese" rule, which took short Chinese lines for Japanese).
     if engines.get("ja"):
-        text = recognize(engines["ja"])
-        letters = [ch for ch in text if not ch.isspace()]
-        kana = sum("぀" <= ch <= "ヿ" for ch in letters)
-        han = len(KANJI_RE.findall(text))
+        ja_text = recognize(engines["ja"])
+        letters = [ch for ch in ja_text if not ch.isspace()]
         latin = sum(ch.isascii() and ch.isalpha() for ch in letters)
-        if letters and kana / len(letters) >= OCR_KANA_RATIO:
-            return text
-        if latin > 2 * han:
-            return recognize(engines["en"]) if engines.get("en") else text
+        if latin > 2 * len(KANJI_RE.findall(ja_text)):
+            return recognize(engines["en"]) if engines.get("en") else ja_text
         if not engines.get("zh"):
-            return text
-    elif engines.get("en") and not engines.get("zh"):
+            return ja_text
+        zh_text = recognize(engines["zh"])
+        return ja_text if ocr_score(ja_text, "ja") > ocr_score(zh_text, "zh") else zh_text
+    if engines.get("en") and not engines.get("zh"):
         return recognize(engines["en"])
     return recognize(engines.get("zh") or engines.get("en") or engines["user"])
+
+
+def ocr_score(text, language):
+    """Share of characters that are common in `language` ("ja"/"zh"); the misreading engine scores lower."""
+    chars = [ch for ch in text if not ch.isspace()]
+    if not chars:
+        return 0.0
+    # Without any hiragana, katakana that look like Chinese characters are more likely misreadings.
+    suspicious = LOOKALIKE_KATAKANA if language == "ja" and not re.search("[ぁ-ゟ]", text) else set()
+    return sum(ch not in suspicious and is_common_char(ch, language) for ch in chars) / len(chars)
+
+
+def is_common_char(ch, language):
+    if ch.isascii():
+        return True
+    if language == "ja":
+        if "぀" <= ch <= "ヿ":
+            return True
+        try:
+            code = ch.encode("shift_jis")
+        except UnicodeEncodeError:
+            return False
+        return len(code) == 1 or code <= b"\x98\x72"  # symbols and JIS level-1 kanji
+    try:
+        code = ch.encode("gb2312")
+    except UnicodeEncodeError:
+        return False
+    return code[0] <= 0xD7  # symbols and GB2312 level-1 hanzi
 
 
 async def _recognize_async(engine, bitmap):
@@ -404,6 +432,11 @@ def frame_offsets(window):
 
 def clamp(value, low, high):
     return max(low, min(value, max(low, high)))
+
+
+def other_language(name):
+    """Default target for text in `name`: Chinese goes to Japanese, everything else to Chinese."""
+    return "日本語" if name == "中文" else "中文"
 
 
 def detect_language(text):
@@ -847,6 +880,8 @@ class TranslatorApp:
         self.popup_position = (100, 100)
         self.source_var = tk.StringVar(value=AUTO_SOURCE)
         self.target_var = tk.StringVar(value="中文")
+        # Languages as of the last translation, so picking the other side's language can swap them.
+        self.selected_languages = (AUTO_SOURCE, "中文")
         self.direction_label = None
         self.original_box = None
         self.result_box = None
@@ -1141,7 +1176,7 @@ class TranslatorApp:
             return
         # Source language defaults to automatic detection; target defaults to Japanese for Chinese text, else Chinese.
         self.source_var.set(AUTO_SOURCE)
-        self.target_var.set("日本語" if detect_language(text) == "中文" else "中文")
+        self.target_var.set(other_language(detect_language(text)))
         self.show_popup(position=self.popup_position)
         self.start_translation()
 
@@ -1156,9 +1191,13 @@ class TranslatorApp:
             return
         source_name = self.source_var.get()
         source = "auto" if source_name == AUTO_SOURCE else LANGUAGES.get(source_name, "auto")
+        detected = detect_language(self.original_text) if source_name == AUTO_SOURCE else None
+        # NiuTrans rejects identical languages (error 13005), e.g. when 自动识别 detects the target language.
+        if (detected or source_name) == self.target_var.get():
+            self.target_var.set(other_language(detected or source_name))
+        self.selected_languages = (self.source_var.get(), self.target_var.get())
         target_name = self.target_var.get()
         target = LANGUAGES.get(target_name, "zh")
-        detected = detect_language(self.original_text) if source_name == AUTO_SOURCE else None
         # Cache under the detected language, so "auto" and an explicitly chosen language share entries.
         cache_source = LANGUAGES.get(detected, source) if detected else source
         limit = self.max_chars()
@@ -1269,11 +1308,22 @@ class TranslatorApp:
                 self.result_box.insert("end", "\n" + reading, "kana")
         self.result_box.configure(state="disabled")
 
+    def on_language_selected(self, side):
+        """Picking the language the other side already has swaps the two sides, like common translators."""
+        previous_source, previous_target = self.selected_languages
+        if self.source_var.get() == self.target_var.get():
+            if side == "target":
+                self.source_var.set(previous_target)
+            else:
+                self.target_var.set(previous_source if previous_source != AUTO_SOURCE
+                                    else other_language(self.source_var.get()))
+        self.start_translation()
+
     def swap_languages(self):
         source_name = self.source_var.get()
         target_name = self.target_var.get()
         if source_name == AUTO_SOURCE:
-            source_name = detect_language(self.original_text) or ("日本語" if target_name == "中文" else "中文")
+            source_name = detect_language(self.original_text) or other_language(target_name)
         # Like common translators, the current translation becomes the new original text.
         if self.translation_ok and self.translated_text:
             self.original_text = self.translated_text
@@ -1316,14 +1366,14 @@ class TranslatorApp:
         tk.Label(controls, text="原文语言", font=("Microsoft YaHei UI", 9, "bold"), fg=c["heading"], bg=c["bg"]).pack(side="left", padx=(0, self.s(6)))
         source_box = ttk.Combobox(controls, textvariable=self.source_var, values=[AUTO_SOURCE, *LANGUAGES.keys()], state="readonly", width=9, style="Own.TCombobox")
         source_box.pack(side="left")
-        source_box.bind("<<ComboboxSelected>>", lambda _event: self.start_translation())
+        source_box.bind("<<ComboboxSelected>>", lambda _event: self.on_language_selected("source"))
         tk.Button(controls, text="⇄", command=self.swap_languages, font=("Segoe UI Symbol", 13), fg=c["icon"], bg=c["bg"],
                   activebackground=c["hover"], activeforeground=c["accent_active"], relief="flat", bd=0,
                   padx=self.s(6), pady=0, cursor="hand2").pack(side="left", padx=self.s(4))
         tk.Label(controls, text="翻译为", font=("Microsoft YaHei UI", 9, "bold"), fg=c["heading"], bg=c["bg"]).pack(side="left", padx=(0, self.s(6)))
         target_box = ttk.Combobox(controls, textvariable=self.target_var, values=list(LANGUAGES.keys()), state="readonly", width=8, style="Own.TCombobox")
         target_box.pack(side="left")
-        target_box.bind("<<ComboboxSelected>>", lambda _event: self.start_translation())
+        target_box.bind("<<ComboboxSelected>>", lambda _event: self.on_language_selected("target"))
         settings_btn = tk.Button(controls, text="⚙ 设置", command=self.show_settings, font=("Microsoft YaHei UI", 9),
                                  bg=c["card"], fg=c["plain_fg"], activebackground=c["hover"], activeforeground=c["plain_fg"],
                                  relief="flat", bd=0, padx=self.s(10), pady=self.s(4), cursor="hand2")

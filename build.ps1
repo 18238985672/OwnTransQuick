@@ -12,7 +12,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Icon or version file generation failed."
 }
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name OwnTranslation --icon build/logo.ico --version-file build/version.txt --collect-all pystray --collect-all PIL --collect-all pykakasi app.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name OwnTranslation --icon build/logo.ico --version-file build/version.txt --collect-all pystray --collect-all PIL --collect-all pykakasi --collect-all winrt app.py
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed."
 }

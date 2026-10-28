@@ -1,3 +1,4 @@
+import asyncio
 import ctypes
 import ctypes.wintypes
 import datetime
@@ -21,10 +22,10 @@ from tkinter import ttk
 
 import requests
 import pystray
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFont, ImageGrab, ImageOps, ImageTk
 
 APP_NAME = "Own翻译"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 CONFIG_APP_NAME = "NiuTransQuick"
 API_URL = "https://api.niutrans.com/NiuTransServer/translation"
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / CONFIG_APP_NAME
@@ -33,7 +34,14 @@ LOG_FILE = CONFIG_DIR / "log.txt"
 LANGUAGES = {"中文": "zh", "日本語": "ja", "English": "en"}
 AUTO_SOURCE = "自动识别"
 # Config key -> default hotkey. "hotkey" copies the selection first; "clipboard_hotkey" translates the clipboard as-is.
-DEFAULT_HOTKEYS = {"hotkey": "ctrl+alt+1", "clipboard_hotkey": "ctrl+alt+2"}
+# "ocr_hotkey" lets the user select a screen region whose text is recognized (Windows OCR) and translated.
+DEFAULT_HOTKEYS = {"hotkey": "ctrl+alt+1", "clipboard_hotkey": "ctrl+alt+2", "ocr_hotkey": "ctrl+alt+3"}
+# Chinese/Japanese characters and full-width punctuation; Windows OCR puts spaces between them.
+CJK_CHARS = "　-〿぀-ヿ㐀-䶿一-鿿＀-￯"
+CJK_GAP_RE = re.compile(f"(?<=[{CJK_CHARS}]) (?=[{CJK_CHARS}])")
+# Share of kana in the Japanese engine's result above which the text is taken as Japanese.
+OCR_KANA_RATIO = 0.15
+OCR_MISSING_LANGUAGE = "系统没有可用的文字识别语言。请在“设置 → 时间和语言 → 语言和区域”中添加中文或日语，并安装“光学字符识别”。"
 # NiuTrans text translation accepts at most this many characters per request.
 NIUTRANS_MAX_CHARS = 5000
 DEFAULT_MAX_CHARS = 1000
@@ -236,6 +244,88 @@ def kana_reading(text):
     return "\n".join(lines)
 
 
+class OcrError(Exception):
+    """Text recognition failed with a message that can be shown to the user as-is."""
+
+
+def ocr_image(image):
+    """Recognize the text in a PIL image with the Windows OCR engine (Chinese or Japanese, chosen automatically)."""
+    try:
+        from winrt.windows.globalization import Language
+        from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
+        from winrt.windows.media.ocr import OcrEngine
+        from winrt.windows.storage.streams import DataWriter
+    except ImportError:
+        logging.exception("Windows OCR bindings are missing")
+        raise OcrError("缺少 Windows 文字识别组件，无法截图翻译。") from None
+
+    # Small captures are recognized much better when enlarged.
+    if max(image.size) < 1000:
+        scale = min(2, OcrEngine.max_image_dimension // max(image.size))
+        image = image.resize((image.width * scale, image.height * scale), Image.LANCZOS)
+    blue, green, red, alpha = image.convert("RGBA").split()
+    writer = DataWriter()
+    writer.write_bytes(Image.merge("RGBA", (red, green, blue, alpha)).tobytes())  # RGBA -> BGRA byte order
+    bitmap = SoftwareBitmap.create_copy_with_alpha_from_buffer(
+        writer.detach_buffer(), BitmapPixelFormat.BGRA8, image.width, image.height, BitmapAlphaMode.PREMULTIPLIED)
+
+    tags = [language.language_tag for language in OcrEngine.available_recognizer_languages]
+    engines = {}
+    for prefix in ("ja", "zh-Hans", "zh", "en"):
+        tag = next((tag for tag in tags if tag.startswith(prefix)), None)
+        if tag and prefix[:2] not in engines:
+            engines[prefix[:2]] = OcrEngine.try_create_from_language(Language(tag))
+    if not any(engines.values()):
+        engines = {"user": OcrEngine.try_create_from_user_profile_languages()}
+        if not engines["user"]:
+            raise OcrError(OCR_MISSING_LANGUAGE)
+
+    def recognize(engine):
+        return asyncio.run(_recognize_async(engine, bitmap))
+
+    # The wrong engine produces garbage, so read with the Japanese engine first and pick by content:
+    # real Japanese is full of kana; mostly Latin letters means English, which the Japanese engine reads
+    # better than the Chinese one; anything else is Chinese.
+    if engines.get("ja"):
+        text = recognize(engines["ja"])
+        letters = [ch for ch in text if not ch.isspace()]
+        kana = sum("぀" <= ch <= "ヿ" for ch in letters)
+        han = len(KANJI_RE.findall(text))
+        latin = sum(ch.isascii() and ch.isalpha() for ch in letters)
+        if letters and kana / len(letters) >= OCR_KANA_RATIO:
+            return text
+        if latin > 2 * han:
+            return recognize(engines["en"]) if engines.get("en") else text
+        if not engines.get("zh"):
+            return text
+    elif engines.get("en") and not engines.get("zh"):
+        return recognize(engines["en"])
+    return recognize(engines.get("zh") or engines.get("en") or engines["user"])
+
+
+async def _recognize_async(engine, bitmap):
+    result = await engine.recognize_async(bitmap)
+    lines = []
+    for line in result.lines:
+        rects = [word.bounding_rect for word in line.words]
+        top = min(rect.y for rect in rects)
+        bottom = max(rect.y + rect.height for rect in rects)
+        lines.append((top, bottom, CJK_GAP_RE.sub("", line.text)))
+    # Join wrapped lines back into paragraphs: no separator between Chinese/Japanese characters, a space
+    # between other words, and a line break where the vertical gap shows a new paragraph.
+    text = ""
+    for index, (top, bottom, line) in enumerate(lines):
+        if index:
+            previous_top, previous_bottom, previous = lines[index - 1]
+            height = max(bottom - top, previous_bottom - previous_top, 1)
+            if top - previous_bottom > 0.8 * height:
+                text += "\n"
+            elif not (re.search(f"[{CJK_CHARS}]$", previous) and re.match(f"[{CJK_CHARS}]", line)):
+                text += " "
+        text += line
+    return text.strip()
+
+
 def get_cursor_position():
     point = ctypes.wintypes.POINT()
     try:
@@ -264,6 +354,34 @@ def get_work_area(x, y):
     except Exception:
         logging.exception("Could not read monitor work area")
     return 0, 0, ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
+
+
+def monitor_rects(x, y):
+    """Bounds of the monitor at (x, y): (in this process's coordinates, in physical pixels).
+
+    They differ on a monitor whose scale is not the system DPI; Pillow captures the screen in physical pixels.
+    """
+    user32 = ctypes.windll.user32
+    user32.MonitorFromPoint.argtypes = [ctypes.wintypes.POINT, ctypes.wintypes.DWORD]
+    user32.MonitorFromPoint.restype = ctypes.c_void_p
+    user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    monitor = ctypes.c_void_p(user32.MonitorFromPoint(ctypes.wintypes.POINT(int(x), int(y)), 2))
+
+    def bounds():
+        info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+        user32.GetMonitorInfoW(monitor, ctypes.byref(info))
+        rect = info.rcMonitor
+        return rect.left, rect.top, rect.right, rect.bottom
+
+    logical = bounds()
+    previous = user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    try:
+        physical = bounds()
+    finally:
+        if previous:
+            user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(previous))
+    return logical, physical
 
 
 def frame_offsets(window):
@@ -714,7 +832,9 @@ class TranslatorApp:
         self.popup = None
         self.settings_win = None
         self.toast = None
-        self.hotkey_callbacks = {"hotkey": self.on_hotkey, "clipboard_hotkey": self.on_clipboard_hotkey}
+        self.hotkey_callbacks = {"hotkey": self.on_hotkey, "clipboard_hotkey": self.on_clipboard_hotkey,
+                                 "ocr_hotkey": self.on_ocr_hotkey}
+        self.snip_win = None
         self.hotkey_manager = HotkeyManager(lambda name: self.hotkey_callbacks[name]())
         self.hotkey_error = None
         self.original_text = ""
@@ -737,11 +857,7 @@ class TranslatorApp:
         self.icon_images = [ImageTk.PhotoImage(make_logo(64)), ImageTk.PhotoImage(make_logo(32))]
         self.root.iconphoto(True, *self.icon_images)
         self.setup_style()
-        if not self.apply_hotkeys({name: self.config.get(name, default) for name, default in DEFAULT_HOTKEYS.items()}):
-            problem = self.hotkey_error
-            if self.apply_hotkeys(dict(DEFAULT_HOTKEYS)):
-                problem += "，已改用默认快捷键"
-            self.root.after(1000, lambda: self.show_toast(f"快捷键 {problem}，可在设置中修改"))
+        self.register_startup_hotkeys()
         if self.config.get("show_kana", True):
             # Warm up the kana dictionary so the first Japanese translation is not delayed.
             threading.Thread(target=get_kakasi, daemon=True).start()
@@ -806,6 +922,21 @@ class TranslatorApp:
             self.tray_icon.title = self.tray_title()
         return True
 
+    def register_startup_hotkeys(self):
+        """Register the configured hotkeys; any that fail (e.g. taken by another program) are skipped, not all."""
+        wanted = {name: self.config.get(name, default) for name, default in DEFAULT_HOTKEYS.items()}
+        if self.apply_hotkeys(wanted):
+            return
+        working, problems = {}, []
+        for name, hotkey in wanted.items():
+            if self.hotkey_manager.set({**working, name: hotkey}) is None:
+                working[name] = hotkey
+            else:
+                problems.append(hotkey_label(hotkey))
+        self.hotkey_manager.set(working)
+        message = f"快捷键 {'、'.join(problems)} 已被其他程序占用或无效，可在设置中修改"
+        self.root.after(1000, lambda: self.show_toast(message))
+
     def suspend_hotkeys(self):
         # Registered hotkeys swallow their key presses, so they must be off while a new one is recorded.
         self.hotkey_manager.set({})
@@ -830,6 +961,109 @@ class TranslatorApp:
             return
         self.popup_position = get_cursor_position()
         self.root.after(0, self.capture_clipboard_and_translate)
+
+    def on_ocr_hotkey(self):
+        if self.paused or self.recording_hotkey:
+            return
+        self.root.after(0, self.start_screenshot)
+
+    def start_screenshot(self):
+        """Freeze the monitor under the mouse and let the user drag a rectangle to recognize and translate."""
+        if self.snip_win and self.snip_win.winfo_exists():
+            return
+        cursor = get_cursor_position()
+        self.popup_position = cursor
+        logical, physical = monitor_rects(*cursor)
+        shot = ImageGrab.grab(bbox=physical, all_screens=True)
+        left, top, right, bottom = logical
+        width, height = right - left, bottom - top
+        # The capture is in physical pixels; show it at this process's (possibly DPI-scaled) size.
+        view = shot if shot.size == (width, height) else shot.resize((width, height), Image.LANCZOS)
+        scale_x, scale_y = shot.width / width, shot.height / height
+
+        win = tk.Toplevel(self.root)
+        self.snip_win = win
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry(f"{width}x{height}+{left}+{top}")
+        canvas = tk.Canvas(win, width=width, height=height, highlightthickness=0, bd=0, cursor="crosshair")
+        canvas.pack()
+        images = {"dim": ImageTk.PhotoImage(ImageEnhance.Brightness(view).enhance(0.55)), "bright": None}
+        canvas.create_image(0, 0, anchor="nw", image=images["dim"])
+        hint = "拖动鼠标框选要翻译的文字，Esc 或右键取消"
+        hint_item = canvas.create_text(width // 2, self.s(40), text=hint, font=("Microsoft YaHei UI", 11),
+                                       fill="#ffffff")
+        x1, y1, x2, y2 = canvas.bbox(hint_item)
+        pad = self.s(12)
+        canvas.tag_lower(canvas.create_rectangle(x1 - pad, y1 - pad // 2, x2 + pad, y2 + pad // 2,
+                                                 fill="#20334d", outline=""), hint_item)
+        selection = {"start": None, "box": None, "pending": False}
+        bright_item = canvas.create_image(0, 0, anchor="nw")
+        border_item = canvas.create_rectangle(0, 0, 0, 0, outline=self.c["accent"], width=max(1, self.s(2)), state="hidden")
+
+        def current_box(event):
+            sx, sy = selection["start"]
+            return min(sx, event.x), min(sy, event.y), max(sx, event.x), max(sy, event.y)
+
+        def redraw():
+            # Coalesced: re-cropping the bright area on every mouse event would lag on large monitors.
+            selection["pending"] = False
+            box = selection["box"]
+            if not box or box[2] - box[0] < 1 or box[3] - box[1] < 1:
+                return
+            images["bright"] = ImageTk.PhotoImage(view.crop(box))
+            canvas.itemconfigure(bright_item, image=images["bright"])
+            canvas.coords(bright_item, box[0], box[1])
+            canvas.coords(border_item, *box)
+            canvas.itemconfigure(border_item, state="normal")
+
+        def press(event):
+            selection["start"] = (event.x, event.y)
+
+        def drag(event):
+            if selection["start"]:
+                selection["box"] = current_box(event)
+                if not selection["pending"]:
+                    selection["pending"] = True
+                    win.after(15, redraw)
+
+        def release(event):
+            if not selection["start"]:
+                return
+            box = current_box(event)
+            close()
+            if box[2] - box[0] < self.s(6) or box[3] - box[1] < self.s(6):
+                return  # A click without a real drag.
+            crop = shot.crop((round(box[0] * scale_x), round(box[1] * scale_y),
+                              round(box[2] * scale_x), round(box[3] * scale_y)))
+            threading.Thread(target=self.ocr_worker, args=(crop,), daemon=True).start()
+
+        def close(_event=None):
+            if win.winfo_exists():
+                win.destroy()
+            self.snip_win = None
+
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", release)
+        canvas.bind("<Button-3>", close)
+        win.bind("<Escape>", close)
+        win.images = images  # Keep the PhotoImages alive with the window.
+        win.focus_force()
+        win.grab_set()
+
+    def ocr_worker(self, image):
+        try:
+            text = ocr_image(image)
+        except OcrError as exc:
+            message = str(exc)
+            self.root.after(0, lambda: self.show_toast(message))
+            return
+        except Exception:
+            logging.exception("Text recognition failed")
+            self.root.after(0, lambda: self.show_toast("文字识别失败，详情见日志"))
+            return
+        self.root.after(0, lambda: self.capture_clipboard_and_translate(text, empty_message="没有识别到文字"))
 
     def copy_selection_worker(self):
         try:
@@ -879,7 +1113,7 @@ class TranslatorApp:
         toast.geometry(f"+{x}+{y}")
         toast.after(1500, toast.destroy)
 
-    def capture_clipboard_and_translate(self, text=None):
+    def capture_clipboard_and_translate(self, text=None, empty_message="剪贴板中没有文字"):
         """Translate `text`, or the current clipboard text if it is None."""
         if text is None:
             try:
@@ -888,7 +1122,7 @@ class TranslatorApp:
                 text = ""
         text = text.strip()
         if not text:
-            self.show_toast("剪贴板中没有文字")
+            self.show_toast(empty_message)
             return
         self.original_text = text
         self.translated_text = ""
@@ -1613,7 +1847,8 @@ class TranslatorApp:
         tk.Frame(hotkey_card, bg=card_bg, height=self.s(6)).pack(fill="x")
         hotkey_vars = {}
         hotkey_rows = [("hotkey", "翻译选中文字", "在任意软件中选中文字后按下，自动复制并翻译"),
-                       ("clipboard_hotkey", "翻译剪贴板", "直接翻译剪贴板里已有的文字，适合无法自动复制的软件")]
+                       ("clipboard_hotkey", "翻译剪贴板", "直接翻译剪贴板里已有的文字，适合无法自动复制的软件"),
+                       ("ocr_hotkey", "截图翻译", "框选屏幕上的区域，识别其中的文字（Windows 自带 OCR）并翻译")]
         for index, (config_key, title, desc) in enumerate(hotkey_rows):
             var = tk.StringVar(value=self.config.get(config_key, DEFAULT_HOTKEYS[config_key]))
             hotkey_vars[config_key] = var
@@ -1684,7 +1919,7 @@ class TranslatorApp:
             hotkeys = {config_key: var.get() for config_key, var in hotkey_vars.items()}
             if len(set(hotkeys.values())) < len(hotkeys):
                 select_page("快捷键")
-                error_label.configure(text="两个快捷键不能相同。")
+                error_label.configure(text="几个快捷键不能相同。")
                 return
             try:
                 max_chars = int(max_chars_var.get())
@@ -1740,11 +1975,11 @@ class TranslatorApp:
         label.configure(text=f"{count:,}")
 
     def tray_title(self):
-        selection = hotkey_label(self.config.get("hotkey", DEFAULT_HOTKEYS["hotkey"]))
-        clipboard = hotkey_label(self.config.get("clipboard_hotkey", DEFAULT_HOTKEYS["clipboard_hotkey"]))
-        # Windows shows each line of the tray tooltip on its own row.
+        label = lambda name: hotkey_label(self.config.get(name, DEFAULT_HOTKEYS[name]))
+        # Windows shows each line of the tray tooltip on its own row (128 characters at most).
         header = f"{APP_NAME}  {APP_VERSION}" + ("（已暂停）" if self.paused else "")
-        return f"{header}\n选中翻译：{selection}\n剪贴板翻译：{clipboard}"
+        return (f"{header}\n选中翻译：{label('hotkey')}\n剪贴板翻译：{label('clipboard_hotkey')}"
+                f"\n截图翻译：{label('ocr_hotkey')}")
 
     def show_last_translation(self):
         if not (self.popup and self.popup.winfo_exists() and self.original_text):
@@ -1759,6 +1994,8 @@ class TranslatorApp:
         menu = pystray.Menu(
             # The default item also runs when the tray icon is left-clicked.
             pystray.MenuItem("显示上次翻译", lambda icon, item: self.root.after(0, self.show_last_translation), default=True),
+            # Short delay so the tray menu has closed before the screen is captured.
+            pystray.MenuItem("截图翻译", lambda icon, item: self.root.after(300, self.start_screenshot)),
             pystray.MenuItem("设置", lambda icon, item: self.root.after(0, self.show_settings)),
             pystray.MenuItem("暂停/恢复快捷键", self.toggle_pause),
             pystray.MenuItem("退出", self.quit_app),

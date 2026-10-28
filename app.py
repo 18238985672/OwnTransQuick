@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ctypes
 import ctypes.wintypes
 import datetime
@@ -26,7 +27,10 @@ import pystray
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFont, ImageGrab, ImageOps, ImageTk
 
 APP_NAME = "Own翻译"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
+# Where new versions are published (shown on the settings About page); Gitee is faster from mainland China.
+GITHUB_URL = "https://github.com/zhangzht-lab/OwnTransQuick"
+GITEE_URL = "https://gitee.com/zhang-bantao/OwnTransQuick"
 CONFIG_APP_NAME = "NiuTransQuick"
 API_URL = "https://api.niutrans.com/NiuTransServer/translation"
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / CONFIG_APP_NAME
@@ -43,6 +47,31 @@ CJK_GAP_RE = re.compile(f"(?<=[{CJK_CHARS}]) (?=[{CJK_CHARS}])")
 # Katakana the Japanese OCR engine produces when it misreads Chinese characters (カ/力, ー/一, エ/工, ロ/口 ...).
 LOOKALIKE_KATAKANA = set("カエロニハトタヒームオ")
 OCR_MISSING_LANGUAGE = "系统没有可用的文字识别语言。请在“设置 → 时间和语言 → 语言和区域”中添加中文或日语，并安装“光学字符识别”。"
+# Optional Baidu AI Cloud OCR (通用文字识别), used instead of Windows OCR when keys are set.
+BAIDU_TOKEN_URL = "https://aip.baidubce.com/oauth/2.0/token"
+BAIDU_OCR_URL = "https://aip.baidubce.com/rest/2.0/ocr/v1/"
+# The four 通用文字识别 APIs, each with its own free quota: path -> (name, returns line positions, language
+# parameters). The high-accuracy ones read better (99 % vs 98 % on the test samples); the standard ones reject
+# language_type=auto_detect but detect the language themselves with detect_language=true.
+BAIDU_APIS = {
+    "accurate": ("高精度含位置版", True, {"language_type": "auto_detect"}),
+    "accurate_basic": ("高精度版", False, {"language_type": "auto_detect"}),
+    "general": ("标准含位置版", True, {"detect_language": "true"}),
+    "general_basic": ("标准版", False, {"detect_language": "true"}),
+}
+# Errors that only concern one API (its quota is used up, or it is not enabled), so the next API is tried.
+BAIDU_QUOTA_ERRORS = {4, 6, 17, 19}
+BAIDU_ERRORS = {
+    4: "百度 OCR 的调用总量已用完。",
+    6: "这个百度应用没有开通该文字识别接口，请在百度智能云控制台开通或领取免费额度。",
+    14: "百度 OCR 的 API Key 或 Secret Key 不正确。",
+    17: "百度 OCR 今天的免费调用次数已用完。",
+    18: "百度 OCR 请求太频繁，请稍后再试。",
+    19: "百度 OCR 的调用总量已用完。",
+    216201: "图片格式不受百度 OCR 支持。",
+    216202: "截图尺寸不符合百度 OCR 的要求。",
+    282000: "百度 OCR 服务内部错误，请稍后再试。",
+}
 # NiuTrans text translation accepts at most this many characters per request.
 NIUTRANS_MAX_CHARS = 5000
 DEFAULT_MAX_CHARS = 1000
@@ -77,6 +106,12 @@ ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 # Seconds to wait for the user to release the hotkey, and for the target app to update the clipboard.
 HOTKEY_RELEASE_TIMEOUT = 1.0
 CLIPBOARD_UPDATE_TIMEOUT = 1.0
+# "替换原文": seconds to wait for the source window to come back to the front, and for it to read the
+# pasted translation before the user's clipboard is put back.
+REPLACE_FOCUS_TIMEOUT = 1.0
+PASTE_RESTORE_DELAY = 0.5
+# Seconds to wait for Ctrl+C when checking that the original text is still selected.
+RESELECT_COPY_TIMEOUT = 0.5
 CACHE_SIZE = 200
 # Line limits for each text box when the popup is fitted to its content.
 MIN_TEXT_LINES = 2
@@ -142,6 +177,9 @@ def load_config():
         "show_kana": True,
         # Screenshot translation draws the translation over the selected area instead of opening the popup.
         "ocr_inplace": True,
+        # Baidu OCR keys; when either is empty, screenshots are read with Windows OCR.
+        "baidu_ocr_api_key": "",
+        "baidu_ocr_secret_key": "",
         "max_chars": DEFAULT_MAX_CHARS,
         "always_on_top": True,
         "usage_date": datetime.date.today().isoformat(),
@@ -357,6 +395,112 @@ async def _recognize_async(engine, bitmap):
                       max(rect.x + rect.width for rect in rects), max(rect.y + rect.height for rect in rects),
                       CJK_GAP_RE.sub("", line.text)))
     return lines
+
+
+_baidu_tokens = {}  # (api_key, secret_key) -> (access_token, monotonic expiry)
+
+
+def baidu_access_token(api_key, secret_key, refresh=False):
+    """OAuth token for Baidu AI Cloud, cached until shortly before it expires (it is valid for 30 days)."""
+    cached = _baidu_tokens.get((api_key, secret_key))
+    if cached and not refresh and time.monotonic() < cached[1]:
+        return cached[0]
+    data = baidu_request(BAIDU_TOKEN_URL, params={"grant_type": "client_credentials", "client_id": api_key,
+                                                  "client_secret": secret_key})
+    if "access_token" not in data:
+        # Wrong keys come back as {"error": "invalid_client", ...}.
+        logging.warning("Baidu OCR token request failed: %s", data.get("error"))
+        raise OcrError(BAIDU_ERRORS[14])
+    _baidu_tokens[(api_key, secret_key)] = (data["access_token"],
+                                            time.monotonic() + int(data.get("expires_in", 86400)) - 3600)
+    return data["access_token"]
+
+
+def baidu_request(url, **kwargs):
+    try:
+        response = requests.post(url, timeout=REQUEST_TIMEOUT, **kwargs)
+        return response.json()
+    except requests.Timeout:
+        raise OcrError(f"百度 OCR 超过 {REQUEST_TIMEOUT} 秒没有响应。") from None
+    except requests.RequestException:
+        raise OcrError("无法连接百度 OCR 服务器，请检查网络。") from None
+    except ValueError:
+        raise OcrError("百度 OCR 返回了无法识别的数据。") from None
+
+
+_baidu_unavailable = {}  # (api_key, API path) -> the day its quota ran out or it was refused; skipped that day.
+
+
+class BaiduQuotaError(OcrError):
+    """The single Baidu OCR API asked for has no quota left or is not enabled (`code` is Baidu's error code)."""
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def baidu_ocr(image, api_key, secret_key, positions=True, apis=None):
+    """Recognize text with Baidu OCR (Chinese, Japanese, English ... detected automatically).
+
+    Tries the APIs in order and moves on when one's quota is used up: with `positions` (drawing the translation
+    over the screenshot) only the two that return line positions, otherwise the ones without positions first,
+    which leaves the positioned quota for in-place translation. `apis` forces a list of API paths.
+    Returns (OcrPage, API name); the page has no blocks when the API returns no positions."""
+    # Baidu needs both sides >= 15 px and at most 8192 px.
+    scale = max(1.0, 15 / min(image.size))
+    scale = min(scale, 8192 / max(image.size))
+    if scale != 1:
+        image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.LANCZOS)
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, "PNG")
+    if buffer.tell() > 7 * 1024 * 1024:  # The base64 image must stay under 10 MB.
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, "JPEG", quality=90)
+    image_data = base64.b64encode(buffer.getvalue()).decode("ascii")
+    if apis is None:
+        apis = ["accurate", "general"] if positions else ["accurate_basic", "accurate", "general_basic", "general"]
+    today = datetime.date.today().isoformat()
+    quota_error = None
+    for path in apis:
+        name, has_positions, language = BAIDU_APIS[path]
+        if _baidu_unavailable.get((api_key, path)) == today:
+            continue
+        for attempt in range(2):
+            token = baidu_access_token(api_key, secret_key, refresh=attempt > 0)
+            data = baidu_request(BAIDU_OCR_URL + path, params={"access_token": token},
+                                 data={"image": image_data, **language})
+            code = data.get("error_code")
+            if code in (110, 111) and attempt == 0:  # Token invalid or expired: get a new one and retry.
+                continue
+            break
+        if not code:
+            return baidu_page(data, scale, has_positions), name
+        logging.warning("Baidu OCR %s failed with error %s", path, code)
+        message = BAIDU_ERRORS.get(code) or f"百度 OCR 返回错误：{data.get('error_msg') or '未知错误'}"
+        if code not in BAIDU_QUOTA_ERRORS:
+            raise OcrError(f"{message}（错误码 {code}）")
+        _baidu_unavailable[(api_key, path)] = today
+        quota_error = (message, name, code)
+    if len(apis) == 1 and quota_error:
+        message, name, code = quota_error
+        raise BaiduQuotaError(f"{message.rstrip('。')}（{name}，错误码 {code}）", code)
+    raise OcrError("百度 OCR 可用接口的免费额度今天都已用完或未开通。")
+
+
+def baidu_page(data, scale, has_positions):
+    if not has_positions:
+        # Without positions there is nothing to group lines into paragraphs by; keep one line per line.
+        text = "\n".join(line for item in data.get("words_result") or ()
+                         if (line := CJK_GAP_RE.sub("", item.get("words", "")).strip()))
+        return OcrPage(text, [])
+    lines = []
+    for item in data.get("words_result") or ():
+        box = item.get("location") or {}
+        left, top = box.get("left", 0) / scale, box.get("top", 0) / scale
+        lines.append((left, top, left + box.get("width", 0) / scale, top + box.get("height", 0) / scale,
+                      CJK_GAP_RE.sub("", item.get("words", "")).strip()))
+    blocks = group_blocks([line for line in lines if line[4]])
+    return OcrPage("\n".join(block.text for block in blocks), blocks)
 
 
 def group_blocks(lines):
@@ -674,6 +818,12 @@ _user32.GetClipboardData.argtypes = [ctypes.c_uint]
 _user32.GetClipboardData.restype = ctypes.c_void_p
 _user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 _user32.SetClipboardData.restype = ctypes.c_void_p
+_user32.GetForegroundWindow.restype = ctypes.c_void_p
+_user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+_user32.IsWindow.argtypes = [ctypes.c_void_p]
+_user32.IsIconic.argtypes = [ctypes.c_void_p]
+_user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.DWORD)]
 _kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 _kernel32.GlobalLock.restype = ctypes.c_void_p
 _kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
@@ -723,8 +873,9 @@ def backup_clipboard(hwnd):
 
 
 def restore_clipboard(hwnd, items):
+    """Replace the clipboard with [(format, bytes)] items; False if the clipboard could not be opened."""
     if items is None or not open_clipboard(hwnd):
-        return
+        return False
     try:
         _user32.EmptyClipboard()
         for fmt, data in items:
@@ -736,8 +887,19 @@ def restore_clipboard(hwnd, items):
             _kernel32.GlobalUnlock(handle)
             if not _user32.SetClipboardData(fmt, handle):
                 _kernel32.GlobalFree(handle)  # Ownership only passes to Windows on success.
+        return True
     finally:
         _user32.CloseClipboard()
+
+
+def write_clipboard_text(hwnd, text):
+    return restore_clipboard(hwnd, [(CF_UNICODETEXT, (text + "\0").encode("utf-16-le"))])
+
+
+def window_process_id(hwnd):
+    pid = ctypes.wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
 
 
 def read_clipboard_text(hwnd):
@@ -904,9 +1066,16 @@ def pressed_modifiers():
     return [name for name in HOTKEY_MODIFIERS if any(key_down(vk) for vk in MODIFIER_VKS[name])]
 
 
-def send_ctrl_c():
-    for vk, flags in ((0x11, 0), (0x43, 0), (0x43, 2), (0x11, 2)):  # Ctrl down, C down, C up, Ctrl up
+def send_key(vk):
+    for flags in (1, 3):  # KEYEVENTF_EXTENDEDKEY (arrow keys), then with KEYEVENTF_KEYUP
         ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+
+
+def send_ctrl(letter):
+    """Press Ctrl+<letter> (e.g. "C" to copy, "V" to paste) in the foreground window."""
+    vk = ord(letter)
+    for key, flags in ((0x11, 0), (vk, 0), (vk, 2), (0x11, 2)):  # Ctrl down, key down, key up, Ctrl up
+        ctypes.windll.user32.keybd_event(key, 0, flags, 0)
 
 
 _user32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
@@ -1093,6 +1262,10 @@ class TranslatorApp:
         self.result_box = None
         self.status_label = None
         self.translate_button = None
+        self.copy_button = None
+        self.replace_button = None
+        self.replace_window = None  # Window the current text was selected in, for "替换原文".
+        self.replace_selected = ""
         self.is_translating = False
         self.settings_usage_label = None
         # Default title-bar/taskbar icon for every window; keep references so Tk does not drop the images.
@@ -1196,7 +1369,7 @@ class TranslatorApp:
 
     def first_run_check(self):
         if not self.config.get("api_key"):
-            self.show_settings()
+            self.show_settings("文字翻译")
 
     def on_hotkey(self):
         # Runs on the hotkey thread; keep it short so further hotkey messages are not delayed.
@@ -1305,8 +1478,24 @@ class TranslatorApp:
         win.grab_set()
 
     def ocr_worker(self, image, screen_box):
+        note = ""
+        inplace = self.config.get("ocr_inplace", True)
         try:
-            page = ocr_image(image)
+            api_key = self.config.get("baidu_ocr_api_key", "").strip()
+            secret_key = self.config.get("baidu_ocr_secret_key", "").strip()
+            page = None
+            if api_key and secret_key:
+                try:
+                    # Drawing over the screenshot needs line positions; the popup only needs the text.
+                    page, _api = baidu_ocr(image, api_key, secret_key, positions=inplace)
+                except OcrError as exc:
+                    # Fall back to the local engine, and say why the result may be worse than usual.
+                    note = f"{str(exc).rstrip('。')}，已改用 Windows OCR"
+                except Exception:
+                    logging.exception("Baidu OCR failed")
+                    note = "百度 OCR 出错，已改用 Windows OCR"
+            if page is None:
+                page = ocr_image(image)
         except OcrError as exc:
             message = str(exc)
             self.root.after(0, lambda: self.show_toast(message))
@@ -1315,15 +1504,22 @@ class TranslatorApp:
             logging.exception("Text recognition failed")
             self.root.after(0, lambda: self.show_toast("文字识别失败，详情见日志"))
             return
-        if page.blocks and self.config.get("ocr_inplace", True):
-            self.root.after(0, lambda: self.start_image_translation(image, screen_box, page))
+        if page.blocks and inplace:
+            self.root.after(0, lambda: self.start_image_translation(image, screen_box, page, note))
         else:
-            self.root.after(0, lambda: self.capture_clipboard_and_translate(page.text, empty_message="没有识别到文字"))
+            def show():
+                self.capture_clipboard_and_translate(page.text, empty_message="没有识别到文字")
+                if note:
+                    self.show_toast(note)
+            self.root.after(0, show)
 
-    def start_image_translation(self, image, screen_box, page):
-        """Translate every recognized paragraph and show the result drawn over the selected screen area."""
+    def start_image_translation(self, image, screen_box, page, note=""):
+        """Translate every recognized paragraph and show the result drawn over the selected screen area.
+        `note` is a message to show with it, e.g. that Baidu OCR failed and Windows OCR was used."""
+        if note:
+            self.show_toast(note)
         if not self.config.get("api_key"):
-            self.show_settings()
+            self.show_settings("文字翻译")
             return
         detected = detect_language(page.text)
         target_name = other_language(detected)
@@ -1340,7 +1536,7 @@ class TranslatorApp:
             self.cache.move_to_end(key)
             self.finish_image_translation(image, screen_box, page, blocks, self.cache[key].split("\n"), target_name, [])
             return
-        self.show_toast("正在翻译……")
+        self.show_toast(f"{note}，正在翻译……" if note else "正在翻译……")
         threading.Thread(target=self.image_translation_worker,
                          args=(image, screen_box, page, blocks, key, target_name), daemon=True).start()
 
@@ -1455,12 +1651,16 @@ class TranslatorApp:
             deadline = time.monotonic() + HOTKEY_RELEASE_TIMEOUT
             while time.monotonic() < deadline and any(key_down(vk) for vk in held):
                 time.sleep(0.01)
+            # The window holding the selection, for "替换原文" (not our own popup's text box).
+            source_window = _user32.GetForegroundWindow()
+            if source_window and window_process_id(source_window) == os.getpid():
+                source_window = None
             # Save what the user had copied, so it can be put back after reading the selection.
             backup = backup_clipboard(self.clipboard_hwnd)
             if backup is None:
                 logging.warning("Clipboard could not be backed up; it will not be restored")
             before = get_clipboard_sequence()
-            send_ctrl_c()
+            send_ctrl("C")
             deadline = time.monotonic() + CLIPBOARD_UPDATE_TIMEOUT
             while get_clipboard_sequence() == before:
                 if time.monotonic() >= deadline:
@@ -1471,9 +1671,110 @@ class TranslatorApp:
             time.sleep(0.05)
             text = read_clipboard_text(self.clipboard_hwnd)
             restore_clipboard(self.clipboard_hwnd, backup)
-            self.root.after(0, lambda: self.capture_clipboard_and_translate(text))
+            self.root.after(0, lambda: self.capture_clipboard_and_translate(text, source_window=source_window))
         finally:
             self.is_capturing = False
+
+    def replace_selection(self):
+        """Paste the translation over the text that is still selected in the window it was copied from."""
+        hwnd, text = self.replace_window, self.translated_text
+        if not (self.translation_ok and text) or self.is_capturing:
+            return
+        if not hwnd or not _user32.IsWindow(hwnd):
+            self.replace_window = None
+            self.update_replace_button()
+            self.show_toast("原窗口已关闭，无法替换")
+            return
+        self.is_capturing = True
+        # Only the foreground process may bring another window to the front, so switch before hiding the popup.
+        if _user32.IsIconic(hwnd):
+            _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        _user32.SetForegroundWindow(hwnd)
+        if not self.pinned:
+            self.hide_popup()
+        threading.Thread(target=self.paste_worker, args=(hwnd, text, self.replace_selected), daemon=True).start()
+
+    def paste_worker(self, hwnd, text, selected):
+        def give_up(message):
+            # Leave the translation on the clipboard so the user can paste it by hand.
+            write_clipboard_text(self.clipboard_hwnd, text)
+            self.root.after(0, lambda: self.show_toast(message))
+
+        try:
+            backup = backup_clipboard(self.clipboard_hwnd)
+            deadline = time.monotonic() + REPLACE_FOCUS_TIMEOUT
+            while _user32.GetForegroundWindow() != hwnd:
+                if time.monotonic() >= deadline:
+                    give_up("无法切回原窗口，译文已复制，请手动粘贴")
+                    return
+                time.sleep(0.02)
+            time.sleep(0.05)
+            # Without the original selection, the translation is added after the text instead of replacing it.
+            replaced = self.restore_selection(selected)
+            if not write_clipboard_text(self.clipboard_hwnd, text):
+                restore_clipboard(self.clipboard_hwnd, backup)  # Undo what the selection check copied.
+                self.root.after(0, lambda: self.show_toast("剪贴板被其他程序占用，替换失败"))
+                return
+            send_ctrl("V")
+            if not replaced:
+                self.root.after(0, lambda: self.show_toast("原窗口中的选中状态已丢失，译文已加在后面"))
+            # The selection is gone now; replacing again would paste a second copy at the caret.
+            self.root.after(0, self.replace_done, hwnd)
+            # The target app reads the clipboard while handling the keystroke; let it finish first.
+            time.sleep(PASTE_RESTORE_DELAY)
+            restore_clipboard(self.clipboard_hwnd, backup)
+        finally:
+            self.is_capturing = False
+
+    def restore_selection(self, selected):
+        """Check (with Ctrl+C) that the foreground window still has `selected` selected, so pasting replaces it.
+        Some inputs, such as Google Translate's, drop the selection when the window loses focus; if the whole
+        field had been selected, Ctrl+A selects the same text again. Otherwise the caret is moved past the
+        current selection (the end of the field after Ctrl+A) and False is returned: pasting then adds the
+        translation after the text instead of overwriting something else."""
+        def same(copied):
+            return copied is not None and " ".join(copied.split()) == " ".join(selected.split())
+
+        copied = self.copy_foreground_text()
+        if same(copied):
+            return True
+        # None: nothing is selected. Other text: something else is selected, or the app copies the current line.
+        if copied is None:
+            send_ctrl("A")
+            time.sleep(0.05)
+            if same(self.copy_foreground_text()):
+                return True
+        send_key(0x27)  # Right arrow collapses the selection to its end.
+        time.sleep(0.05)
+        return False
+
+    def copy_foreground_text(self):
+        """Ctrl+C in the foreground window: the copied text, or None if nothing was copied."""
+        before = get_clipboard_sequence()
+        send_ctrl("C")
+        deadline = time.monotonic() + RESELECT_COPY_TIMEOUT
+        while get_clipboard_sequence() == before:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+        time.sleep(0.05)  # Let the app finish writing all clipboard formats.
+        return read_clipboard_text(self.clipboard_hwnd)
+
+    def replace_done(self, hwnd):
+        if self.replace_window == hwnd:
+            self.replace_window = None
+            self.update_replace_button()
+
+    def update_replace_button(self):
+        """"替换原文" is only offered for selection translations, and is enabled once the translation is done."""
+        button = self.replace_button
+        if not button or not button.winfo_exists():
+            return
+        if self.replace_window:
+            button.pack(side="right", padx=(self.s(6), 0), after=self.copy_button)
+            button.configure(state="normal" if self.translation_ok and self.translated_text else "disabled")
+        else:
+            button.pack_forget()
 
     def show_toast(self, text):
         """Show a short message next to the mouse cursor that disappears by itself."""
@@ -1484,17 +1785,19 @@ class TranslatorApp:
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
         tk.Label(toast, text=text, font=("Microsoft YaHei UI", 9), bg=self.c["toast_bg"], fg=self.c["toast_fg"],
-                 padx=self.s(12), pady=self.s(6)).pack()
+                 padx=self.s(12), pady=self.s(6), wraplength=self.s(360), justify="left").pack()
         toast.update_idletasks()
         x, y = get_cursor_position()
         left, top, right, bottom = get_work_area(x, y)
         x = clamp(x + self.s(14), left, right - toast.winfo_reqwidth())
         y = clamp(y + self.s(18), top, bottom - toast.winfo_reqheight())
         toast.geometry(f"+{x}+{y}")
-        toast.after(1500, toast.destroy)
+        # Longer messages (e.g. why Baidu OCR failed) stay up long enough to be read.
+        toast.after(max(1500, len(text) * 90), toast.destroy)
 
-    def capture_clipboard_and_translate(self, text=None, empty_message="剪贴板中没有文字"):
-        """Translate `text`, or the current clipboard text if it is None."""
+    def capture_clipboard_and_translate(self, text=None, empty_message="剪贴板中没有文字", source_window=None):
+        """Translate `text`, or the current clipboard text if it is None. `source_window` is the window the
+        text was selected in, which "替换原文" pastes the translation back into."""
         if text is None:
             try:
                 text = self.root.clipboard_get()
@@ -1507,23 +1810,28 @@ class TranslatorApp:
         self.original_text = text
         self.translated_text = ""
         self.translation_ok = False
+        self.replace_window = source_window
+        self.replace_selected = text  # What "替换原文" expects to still be selected there.
         if not self.config.get("api_key"):
-            self.show_settings()
+            self.show_settings("文字翻译")
             return
         # Source language defaults to automatic detection; target defaults to Japanese for Chinese text, else Chinese.
         self.source_var.set(AUTO_SOURCE)
         self.target_var.set(other_language(detect_language(text)))
         self.show_popup(position=self.popup_position)
+        self.update_replace_button()
         self.start_translation()
 
-    def start_translation(self):
+    def start_translation(self, force=False):
+        """`force` (the 重新翻译 button and Ctrl+Enter) skips the cache and requests the API again; the new
+        result then replaces the cached one."""
         # The original text box is editable, so always translate what it currently shows.
         if self.original_box and self.original_box.winfo_exists():
             self.original_text = self.original_box.get("1.0", "end-1c").strip()
         if not self.original_text:
             return
         if not self.config.get("api_key"):
-            self.show_settings()
+            self.show_settings("文字翻译")
             return
         source_name = self.source_var.get()
         source = "auto" if source_name == AUTO_SOURCE else LANGUAGES.get(source_name, "auto")
@@ -1549,12 +1857,14 @@ class TranslatorApp:
         self.direction_label.configure(text=f"原文语言：{shown_source}  →  翻译为：{target_name}")
         self.request_id += 1
         key = (cache_source, target, text)
-        if key in self.cache:
+        if key in self.cache and not force:
             self.cache.move_to_end(key)
             self.finish_translation(self.request_id, key, self.cache[key], target_name, from_cache=True)
             return
         self.is_translating = True
+        self.translation_ok = False
         self.translate_button.configure(state="disabled")
+        self.update_replace_button()
         self.status_label.configure(text=f"正在翻译为{target_name}……")
         self.set_result_text("正在翻译……")
         # Translations are usually about as long as the original, so reserve that much room up front.
@@ -1637,6 +1947,7 @@ class TranslatorApp:
             self.status_label.configure(text=status)
         if self.translate_button and self.translate_button.winfo_exists():
             self.translate_button.configure(state="normal")
+        self.update_replace_button()
         self.is_translating = False
         self.fit_popup()
 
@@ -1738,18 +2049,22 @@ class TranslatorApp:
         footer = tk.Frame(shell, bg=c["bg"])
         footer.pack(side="bottom", fill="x")
 
-        def action_button(parent, text, command, primary=False):
-            bg = c["accent"] if primary else c["card"]
-            fg = c["on_accent"] if primary else c["plain_fg"]
-            active_bg = c["accent_active"] if primary else c["hover"]
+        def action_button(parent, text, command, kind="plain"):
+            # "primary": solid accent; "soft": light accent background with accent text; "plain": card colors.
+            bg, fg, active_bg = {"primary": (c["accent"], c["on_accent"], c["accent_active"]),
+                                 "soft": (c["soft_bg"], c["accent"], c["soft_active"]),
+                                 "plain": (c["card"], c["plain_fg"], c["hover"])}[kind]
             btn = tk.Button(parent, text=text, command=command, font=("Microsoft YaHei UI", 9),
                             bg=bg, fg=fg, activebackground=active_bg, activeforeground=fg,
                             relief="flat", bd=0, padx=self.s(10), pady=self.s(5), cursor="hand2", disabledforeground=c["disabled"])
             return btn
 
-        self.translate_button = action_button(footer, "⟳ 重新翻译", self.start_translation)
+        self.translate_button = action_button(footer, "⟳ 重新翻译", lambda: self.start_translation(force=True))
         self.translate_button.pack(side="right", padx=(self.s(6), 0))
-        action_button(footer, "▢ 复制译文", self.copy_translation, primary=True).pack(side="right", padx=(self.s(6), 0))
+        self.copy_button = action_button(footer, "▢ 复制译文", self.copy_translation, kind="primary")
+        self.copy_button.pack(side="right", padx=(self.s(6), 0))
+        # Packed next to "复制译文" by update_replace_button, only for selection translations.
+        self.replace_button = action_button(footer, "⇆ 替换原文", self.replace_selection, kind="soft")
         action_button(footer, "关闭", self.hide_popup).pack(side="right")
         # Packed after the buttons so a long status message cannot squeeze them.
         self.status_label = tk.Label(footer, text="等待翻译", bg=c["bg"], fg=c["status"], anchor="w", font=("Microsoft YaHei UI", 9))
@@ -1796,7 +2111,7 @@ class TranslatorApp:
         self.original_count = make_counter(original_card)
         self.original_box = make_text(original_card)
         self.original_box.pack(fill="both", expand=True, padx=self.s(2), pady=(0, self.s(2)))
-        self.original_box.bind("<Control-Return>", lambda _event: (self.start_translation(), "break")[1])
+        self.original_box.bind("<Control-Return>", lambda _event: (self.start_translation(force=True), "break")[1])
         self.original_box.bind("<<Modified>>", lambda _event: self.update_original_count())
 
         result_card = make_card(shell, "译文", "▣")
@@ -1958,11 +2273,14 @@ class TranslatorApp:
         if self.popup and self.popup.winfo_exists():
             self.popup.lift()
 
-    def show_settings(self):
+    def show_settings(self, start_page=None):
+        """Open the settings window, on `start_page` if given (e.g. "文字翻译" when the API key is missing)."""
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.deiconify()
             self.settings_win.lift()
             self.settings_win.focus_force()
+            if start_page:
+                self.settings_select_page(start_page)
             return
         self.refresh_theme()
         c = self.c
@@ -2145,6 +2463,31 @@ class TranslatorApp:
 
         # 常规
         page = nav_item("常规", "")
+        general_card = card(page)
+        close_var = tk.BooleanVar(value=bool(self.config.get("close_after_copy", True)))
+        option_row(general_card, "复制译文后自动关闭窗口", "点击“复制译文”后自动隐藏翻译窗口",
+                   lambda parent: toggle(parent, close_var), first=True)
+        outside_var = tk.BooleanVar(value=bool(self.config.get("close_on_click_outside", True)))
+        option_row(general_card, "点击窗口外部自动关闭", "切换到其他窗口时自动隐藏翻译窗口；点窗口上的图钉可临时固定",
+                   lambda parent: toggle(parent, outside_var))
+
+        def position_button(parent):
+            def reset():
+                self.reset_popup_position()
+                reset_button.configure(text="已恢复", state="disabled")
+            reset_button = button(parent, "恢复到右下角", reset)
+            if not self.config.get("popup_position"):
+                reset_button.configure(state="disabled")
+            return reset_button
+
+        option_row(general_card, "翻译窗口位置", "默认显示在屏幕右下角；拖动后会记住位置，下次翻译仍在那里",
+                   position_button)
+        autostart_var = tk.BooleanVar(value=get_autostart())
+        option_row(general_card, "开机自动启动", "登录 Windows 后自动在后台运行",
+                   lambda parent: toggle(parent, autostart_var))
+
+        # 文字翻译
+        page = nav_item("文字翻译", "")
         key_card = card(page, "小牛翻译 API Key", "用于调用小牛翻译的文本翻译接口，可在小牛翻译开放平台的控制台中获取。")
         key_var = tk.StringVar(value=self.config.get("api_key", ""))
         key_entry = input_border(tk.Entry(key_card, textvariable=key_var, show="*", font=("Microsoft YaHei UI", 10)))
@@ -2183,28 +2526,97 @@ class TranslatorApp:
                                wraplength=self.s(260))
         test_result.pack(side="right", padx=self.s(8))
 
-        general_card = card(page)
-        close_var = tk.BooleanVar(value=bool(self.config.get("close_after_copy", True)))
-        option_row(general_card, "复制译文后自动关闭窗口", "点击“复制译文”后自动隐藏翻译窗口",
-                   lambda parent: toggle(parent, close_var), first=True)
-        outside_var = tk.BooleanVar(value=bool(self.config.get("close_on_click_outside", True)))
-        option_row(general_card, "点击窗口外部自动关闭", "切换到其他窗口时自动隐藏翻译窗口；点窗口上的图钉可临时固定",
-                   lambda parent: toggle(parent, outside_var))
+        translate_card = card(page)
+        max_chars_var = tk.StringVar(value=str(self.max_chars()))
+        option_row(translate_card, "单次翻译字数上限", f"超出部分不翻译，最多 {NIUTRANS_MAX_CHARS} 字",
+                   lambda parent: input_border(tk.Spinbox(parent, from_=1, to=NIUTRANS_MAX_CHARS, increment=100,
+                                                          textvariable=max_chars_var, width=6,
+                                                          font=("Microsoft YaHei UI", 10), buttonbackground=card_bg)),
+                   first=True)
+        kana_var = tk.BooleanVar(value=bool(self.config.get("show_kana", True)))
+        option_row(translate_card, "日文译文显示假名读音", "在译文下方以小字显示整句的假名读音，复制译文时不包含读音",
+                   lambda parent: toggle(parent, kana_var))
 
-        def position_button(parent):
-            def reset():
-                self.reset_popup_position()
-                reset_button.configure(text="已恢复", state="disabled")
-            reset_button = button(parent, "恢复到右下角", reset)
-            if not self.config.get("popup_position"):
-                reset_button.configure(state="disabled")
-            return reset_button
+        # 截图识别
+        page = nav_item("截图识别", "")
+        ocr_card = card(page, "百度 OCR（可选）",
+                        "填写后截图翻译改用百度智能云“通用文字识别”，识别更准，但截图会上传到百度。"
+                        "译文显示在图上时用高精度含位置版，额度用完改用标准含位置版；在翻译窗口显示时先用不含位置的"
+                        "高精度版和标准版。留空或百度都不可用时使用 Windows 自带 OCR。")
+        ocr_vars = {}
+        ocr_entries = []
+        ocr_grid = tk.Frame(ocr_card, bg=card_bg)
+        ocr_grid.pack(fill="x", pady=self.s(10, 8))
+        ocr_grid.columnconfigure(1, weight=1)
+        for row, (config_key, label) in enumerate([("baidu_ocr_api_key", "API Key"),
+                                                   ("baidu_ocr_secret_key", "Secret Key")]):
+            ocr_vars[config_key] = tk.StringVar(value=self.config.get(config_key, ""))
+            tk.Label(ocr_grid, text=label, font=("Microsoft YaHei UI", 10), fg=text_color, bg=card_bg,
+                     anchor="w").grid(row=row, column=0, sticky="w", padx=(0, self.s(12)), pady=self.s(3))
+            entry = input_border(tk.Entry(ocr_grid, textvariable=ocr_vars[config_key], show="*",
+                                          font=("Microsoft YaHei UI", 10)))
+            entry.grid(row=row, column=1, sticky="ew", pady=self.s(3), ipady=self.s(3))
+            ocr_entries.append(entry)
+        ocr_row = tk.Frame(ocr_card, bg=card_bg)
+        ocr_row.pack(fill="x")
+        ocr_show_var = tk.BooleanVar(value=False)
+        checkbox(ocr_row, "显示密钥", ocr_show_var,
+                 lambda: [entry.configure(show="" if ocr_show_var.get() else "*") for entry in ocr_entries]).pack(side="left")
 
-        option_row(general_card, "翻译窗口位置", "默认显示在屏幕右下角；拖动后会记住位置，下次翻译仍在那里",
-                   position_button)
-        autostart_var = tk.BooleanVar(value=get_autostart())
-        option_row(general_card, "开机自动启动", "登录 Windows 后自动在后台运行",
-                   lambda parent: toggle(parent, autostart_var))
+        def test_ocr_key():
+            api_key = ocr_vars["baidu_ocr_api_key"].get().strip()
+            secret_key = ocr_vars["baidu_ocr_secret_key"].get().strip()
+            if not (api_key and secret_key):
+                ocr_result.configure(text="请先填写 API Key 和 Secret Key。", fg=c["error"])
+                return
+            ocr_test_button.configure(state="disabled")
+            ocr_result.configure(text="正在测试……", fg=c["status"])
+
+            def worker():
+                # Read a small rendered sample with each API, which also checks that each one is enabled and
+                # has quota left (and clears what was remembered as used up today).
+                sample = Image.new("RGB", (160, 40), "white")
+                ImageDraw.Draw(sample).text((10, 8), "Own翻译 OCR", font=render_font("中文", 18), fill="black")
+                states = []
+                try:
+                    for path, (name, _positions, _language) in BAIDU_APIS.items():
+                        _baidu_unavailable.pop((api_key, path), None)
+                        try:
+                            baidu_ocr(sample, api_key, secret_key, apis=[path])
+                            states.append(f"✓ {name}")
+                        except BaiduQuotaError as exc:
+                            states.append(f"✗ {name}（错误码 {exc.code}）")
+                    working = sum(state.startswith("✓") for state in states)
+                    color = c["success"] if working == len(states) else c["status"] if working else c["error"]
+                    text = "\n".join("  ".join(states[i:i + 2]) for i in range(0, len(states), 2))
+                    result = (text, color)
+                except OcrError as exc:
+                    result = (str(exc), c["error"])
+                except Exception:
+                    logging.exception("Baidu OCR test failed")
+                    result = ("测试失败，详情见日志", c["error"])
+
+                def show():
+                    if win.winfo_exists():
+                        ocr_result.configure(text=result[0], fg=result[1])
+                        ocr_test_button.configure(state="normal")
+                self.root.after(0, show)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        ocr_test_button = button(ocr_row, "测试 OCR Key", test_ocr_key)
+        ocr_test_button.pack(side="right")
+        ocr_result = tk.Label(ocr_row, text="", font=("Microsoft YaHei UI", 9), bg=card_bg, justify="left",
+                              wraplength=self.s(260))
+        ocr_result.pack(side="right", padx=self.s(8))
+        button(ocr_card, "打开百度智能云文字识别控制台",
+               lambda: webbrowser.open("https://console.bce.baidu.com/ai/#/ai/ocr/overview/index")).pack(
+            anchor="w", pady=self.s(10, 0))
+
+        screenshot_card = card(page)
+        inplace_var = tk.BooleanVar(value=bool(self.config.get("ocr_inplace", True)))
+        option_row(screenshot_card, "截图翻译直接显示在图上", "像谷歌翻译那样把译文画在截图的原位置；关闭后在翻译窗口中显示",
+                   lambda parent: toggle(parent, inplace_var), first=True)
 
         # 快捷键: recorded as modifiers plus one main key, so the result always parses with parse_hotkey.
         page = nav_item("快捷键", "")
@@ -2269,27 +2681,11 @@ class TranslatorApp:
         hotkey_vars = {}
         hotkey_rows = [("hotkey", "翻译选中文字", "在任意软件中选中文字后按下，自动复制并翻译"),
                        ("clipboard_hotkey", "翻译剪贴板", "直接翻译剪贴板里已有的文字，适合无法自动复制的软件"),
-                       ("ocr_hotkey", "截图翻译", "框选屏幕上的区域，识别其中的文字（Windows 自带 OCR）并翻译")]
+                       ("ocr_hotkey", "截图翻译", "框选屏幕上的区域，识别其中的文字并翻译")]
         for index, (config_key, title, desc) in enumerate(hotkey_rows):
             var = tk.StringVar(value=self.config.get(config_key, DEFAULT_HOTKEYS[config_key]))
             hotkey_vars[config_key] = var
             option_row(hotkey_card, title, desc, lambda parent, var=var: hotkey_recorder(parent, var), first=index == 0)
-
-        # 翻译
-        page = nav_item("翻译", "")
-        translate_card = card(page)
-        max_chars_var = tk.StringVar(value=str(self.max_chars()))
-        option_row(translate_card, "单次翻译字数上限", f"超出部分不翻译，最多 {NIUTRANS_MAX_CHARS} 字",
-                   lambda parent: input_border(tk.Spinbox(parent, from_=1, to=NIUTRANS_MAX_CHARS, increment=100,
-                                                          textvariable=max_chars_var, width=6,
-                                                          font=("Microsoft YaHei UI", 10), buttonbackground=card_bg)),
-                   first=True)
-        kana_var = tk.BooleanVar(value=bool(self.config.get("show_kana", True)))
-        option_row(translate_card, "日文译文显示假名读音", "在译文下方以小字显示整句的假名读音，复制译文时不包含读音",
-                   lambda parent: toggle(parent, kana_var))
-        inplace_var = tk.BooleanVar(value=bool(self.config.get("ocr_inplace", True)))
-        option_row(translate_card, "截图翻译直接显示在图上", "像谷歌翻译那样把译文画在截图的原位置；关闭后在翻译窗口中显示",
-                   lambda parent: toggle(parent, inplace_var))
 
         # 统计
         page = nav_item("统计", "")
@@ -2321,6 +2717,23 @@ class TranslatorApp:
         tk.Label(about_text, text="翻译服务由小牛翻译提供", font=("Microsoft YaHei UI", 9),
                  fg=muted, bg=card_bg, anchor="w").pack(fill="x")
 
+        # Update reminder and download links, inside the same card to keep the page short.
+        tk.Frame(about_card, bg=c["separator"], height=1).pack(fill="x", pady=self.s(10, 8))
+        # No spaces: Tk only wraps at spaces, so a space early in the text would break the line there.
+        tk.Label(about_card, text="新版本会修复问题、增加功能，请定期到以下地址下载最新版（国内推荐Gitee）：",
+                 font=("Microsoft YaHei UI", 9), fg=muted, bg=card_bg, anchor="w", justify="left",
+                 wraplength=self.s(480)).pack(fill="x")
+        links = tk.Frame(about_card, bg=card_bg)
+        links.pack(fill="x", pady=self.s(6, 0))
+        for row, (site, url) in enumerate((("GitHub", GITHUB_URL), ("Gitee", GITEE_URL))):
+            tk.Label(links, text=site, font=("Microsoft YaHei UI", 10), fg=text_color, bg=card_bg,
+                     anchor="w").grid(row=row, column=0, sticky="w", padx=(0, self.s(16)), pady=self.s(2))
+            link = tk.Label(links, text=url, font=("Microsoft YaHei UI", 10, "underline"), fg=accent, bg=card_bg,
+                            cursor="hand2", anchor="w")
+            link.grid(row=row, column=1, sticky="w", pady=self.s(2))
+            # The releases page is where the downloads are.
+            link.bind("<Button-1>", lambda _event, url=url: webbrowser.open(f"{url}/releases"))
+
         def open_config_dir():
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             os.startfile(CONFIG_DIR)
@@ -2350,8 +2763,13 @@ class TranslatorApp:
             except ValueError:
                 max_chars = 0
             if not 1 <= max_chars <= NIUTRANS_MAX_CHARS:
-                select_page("翻译")
+                select_page("文字翻译")
                 error_label.configure(text=f"单次翻译字数上限需要是 1 到 {NIUTRANS_MAX_CHARS} 之间的整数。")
+                return
+            ocr_keys = {config_key: var.get().strip() for config_key, var in ocr_vars.items()}
+            if bool(ocr_keys["baidu_ocr_api_key"]) != bool(ocr_keys["baidu_ocr_secret_key"]):
+                select_page("截图识别")
+                error_label.configure(text="百度 OCR 的 API Key 和 Secret Key 需要同时填写（都留空则使用 Windows OCR）。")
                 return
             if not self.apply_hotkeys(hotkeys):
                 select_page("快捷键")
@@ -2369,6 +2787,7 @@ class TranslatorApp:
             self.config["close_on_click_outside"] = outside_var.get()
             self.config["show_kana"] = kana_var.get()
             self.config["ocr_inplace"] = inplace_var.get()
+            self.config.update(ocr_keys)
             self.config["max_chars"] = max_chars
             save_config(self.config)
             # The popup's "N / limit 字" counter otherwise keeps the old limit until the text changes.
@@ -2381,7 +2800,8 @@ class TranslatorApp:
         error_label.pack(side="left", fill="x", expand=True)
         win.protocol("WM_DELETE_WINDOW", close)
         win.bind("<Escape>", lambda _event: close())
-        select_page("常规")
+        self.settings_select_page = select_page
+        select_page(start_page or "常规")
         win.focus_force()
 
     def refresh_settings_usage(self):

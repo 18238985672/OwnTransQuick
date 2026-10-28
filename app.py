@@ -19,13 +19,12 @@ from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import ttk
 
-import keyboard
 import requests
 import pystray
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, ImageTk
 
 APP_NAME = "Own翻译"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 CONFIG_APP_NAME = "NiuTransQuick"
 API_URL = "https://api.niutrans.com/NiuTransServer/translation"
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / CONFIG_APP_NAME
@@ -53,10 +52,18 @@ NIUTRANS_ERRORS = {
 # Seconds to wait for a translation response; other failures are retried once after a short pause.
 REQUEST_TIMEOUT = 10
 RETRY_DELAY = 0.5
-# Modifier names as the keyboard library knows them, in the order they are written in a hotkey string.
+# Modifier names in the order they are written in a hotkey string such as "ctrl+alt+1".
 HOTKEY_MODIFIERS = ["ctrl", "alt", "shift", "windows"]
+# RegisterHotKey modifier flags and the virtual-key codes that show each modifier is held.
+MOD_FLAGS = {"ctrl": 0x0002, "alt": 0x0001, "shift": 0x0004, "windows": 0x0008}
+MOD_NOREPEAT = 0x4000
+MODIFIER_VKS = {"ctrl": (0x11,), "alt": (0x12,), "shift": (0x10,), "windows": (0x5B, 0x5C)}
 # Windows virtual-key codes of modifier keys (Shift/Ctrl/Alt, left/right variants, Win).
 MODIFIER_VK_CODES = {16, 17, 18, 91, 92, 160, 161, 162, 163, 164, 165}
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+WM_APP_SET_HOTKEYS = 0x8001  # WM_APP + 1
+ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 # Seconds to wait for the user to release the hotkey, and for the target app to update the clipboard.
 HOTKEY_RELEASE_TIMEOUT = 1.0
 CLIPBOARD_UPDATE_TIMEOUT = 1.0
@@ -499,7 +506,7 @@ def save_logo_ico(path):
 
 
 def vk_to_key_name(vk):
-    """Map a Windows virtual-key code to a keyboard-library key name; only letters, digits and F1-F12."""
+    """Map a Windows virtual-key code to a hotkey key name; only letters, digits and F1-F12."""
     if 0x30 <= vk <= 0x39:
         return chr(vk)
     if 0x60 <= vk <= 0x69:  # Numpad digits register as the same digit hotkey.
@@ -509,6 +516,127 @@ def vk_to_key_name(vk):
     if 0x70 <= vk <= 0x7B:
         return f"f{vk - 0x6F}"
     return None
+
+
+def key_vks(key):
+    """Virtual-key codes for a hotkey's main key; a digit also matches the same numpad digit."""
+    if len(key) == 1 and key.isdigit():
+        return [0x30 + int(key), 0x60 + int(key)]
+    if len(key) == 1 and "a" <= key <= "z":
+        return [ord(key.upper())]
+    if key[:1] == "f" and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+        return [0x6F + int(key[1:])]
+    raise ValueError(f"unsupported key {key!r}")
+
+
+def parse_hotkey(hotkey):
+    """"ctrl+alt+1" -> (RegisterHotKey modifier flags, main key VKs, every VK that is held while pressing it)."""
+    *modifiers, key = hotkey.lower().split("+")
+    if not modifiers or any(name not in MOD_FLAGS for name in modifiers):
+        raise ValueError(f"invalid hotkey {hotkey!r}")
+    vks = key_vks(key)
+    held = [vk for name in modifiers for vk in MODIFIER_VKS[name]] + vks
+    return sum(MOD_FLAGS[name] for name in set(modifiers)), vks, held
+
+
+def key_down(vk):
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def pressed_modifiers():
+    return [name for name in HOTKEY_MODIFIERS if any(key_down(vk) for vk in MODIFIER_VKS[name])]
+
+
+def send_ctrl_c():
+    for vk, flags in ((0x11, 0), (0x43, 0), (0x43, 2), (0x11, 2)):  # Ctrl down, C down, C up, Ctrl up
+        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+
+
+_user32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+_user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.GetMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+_user32.PeekMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+_user32.PostThreadMessageW.argtypes = [ctypes.wintypes.DWORD, ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+
+
+class HotkeyManager:
+    """Global hotkeys through RegisterHotKey, served by a dedicated message-loop thread.
+
+    Unlike a low-level keyboard hook, Windows does not silently drop these after sleep or a slow moment.
+    WM_HOTKEY goes to the thread that registered the hotkey, so registering also happens on that thread;
+    `set` hands the new hotkeys over with a thread message and waits for the result.
+    """
+
+    def __init__(self, callback):
+        self.callback = callback  # Called with the config key ("hotkey"/"clipboard_hotkey") on the hotkey thread.
+        self.ids = {}
+        self.current = {}
+        self.request, self.result = {}, None
+        self.done = threading.Event()
+        ready = threading.Event()
+        threading.Thread(target=self._run, args=(ready,), daemon=True, name="hotkeys").start()
+        ready.wait(5)
+
+    def set(self, hotkeys):
+        """Replace all hotkeys with {config key: "ctrl+alt+1"}; returns None, or an error message and keeps the old ones."""
+        self.request, self.result, self.done = dict(hotkeys), "快捷键线程没有响应", threading.Event()
+        _user32.PostThreadMessageW(self.thread_id, WM_APP_SET_HOTKEYS, 0, 0)
+        self.done.wait(5)
+        return self.result
+
+    def stop(self):
+        _user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+
+    def _run(self, ready):
+        msg = ctypes.wintypes.MSG()
+        # Create the thread's message queue before anyone posts to it.
+        _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        self.thread_id = _kernel32.GetCurrentThreadId()
+        ready.set()
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY and msg.wParam in self.ids:
+                try:
+                    self.callback(self.ids[msg.wParam])
+                except Exception:
+                    logging.exception("Hotkey callback failed")
+            elif msg.message == WM_APP_SET_HOTKEYS:
+                self.result = self._apply(self.request)
+                self.done.set()
+        self._unregister()
+
+    def _apply(self, hotkeys):
+        old = dict(self.current)
+        self._unregister()
+        error = self._register(hotkeys)
+        if error:
+            logging.warning("Could not register hotkeys %s: %s", hotkeys, error)
+            self._unregister()
+            self._register(old)
+            return error
+        self.current = dict(hotkeys)
+        return None
+
+    def _register(self, hotkeys):
+        next_id = 1
+        for name, hotkey in hotkeys.items():
+            try:
+                flags, vks, _held = parse_hotkey(hotkey)
+            except ValueError:
+                return f"{hotkey_label(hotkey)} 不是有效的快捷键"
+            for index, vk in enumerate(vks):
+                if _user32.RegisterHotKey(None, next_id, flags | MOD_NOREPEAT, vk):
+                    self.ids[next_id] = name
+                elif index == 0:  # The numpad variant of a digit is optional.
+                    error = ctypes.get_last_error()
+                    reason = "已被其他程序占用" if error == ERROR_HOTKEY_ALREADY_REGISTERED else f"注册失败（错误 {error}）"
+                    return f"{hotkey_label(hotkey)} {reason}"
+                next_id += 1
+        return None
+
+    def _unregister(self):
+        for hotkey_id in self.ids:
+            _user32.UnregisterHotKey(None, hotkey_id)
+        self.ids.clear()
 
 
 def hotkey_label(hotkey):
@@ -587,8 +715,8 @@ class TranslatorApp:
         self.settings_win = None
         self.toast = None
         self.hotkey_callbacks = {"hotkey": self.on_hotkey, "clipboard_hotkey": self.on_clipboard_hotkey}
-        self.hotkey_handles = {}
-        self.hotkey_codes = {}
+        self.hotkey_manager = HotkeyManager(lambda name: self.hotkey_callbacks[name]())
+        self.hotkey_error = None
         self.original_text = ""
         self.truncated_note = ""
         self.translated_text = ""
@@ -610,7 +738,10 @@ class TranslatorApp:
         self.root.iconphoto(True, *self.icon_images)
         self.setup_style()
         if not self.apply_hotkeys({name: self.config.get(name, default) for name, default in DEFAULT_HOTKEYS.items()}):
-            self.apply_hotkeys(dict(DEFAULT_HOTKEYS))
+            problem = self.hotkey_error
+            if self.apply_hotkeys(dict(DEFAULT_HOTKEYS)):
+                problem += "，已改用默认快捷键"
+            self.root.after(1000, lambda: self.show_toast(f"快捷键 {problem}，可在设置中修改"))
         if self.config.get("show_kana", True):
             # Warm up the kana dictionary so the first Japanese translation is not delayed.
             threading.Thread(target=get_kakasi, daemon=True).start()
@@ -665,49 +796,29 @@ class TranslatorApp:
         self.popup = None
 
     def apply_hotkeys(self, hotkeys):
-        """Register {config key: hotkey}; on failure the previous hotkeys are restored and False is returned."""
-        if self.hotkey_handles and all(self.config.get(name) == hotkey for name, hotkey in hotkeys.items()):
-            return True
-        old = {name: self.config.get(name) for name in hotkeys} if self.hotkey_handles else {}
-        # Unregister everything first: the keyboard library also keys its registry by hotkey string,
-        # so overlapping old and new registrations would clobber each other.
-        self.unregister_hotkeys()
-        try:
-            for name, hotkey in hotkeys.items():
-                self.add_hotkey(name, hotkey)
-        except (ValueError, KeyError):
-            logging.warning("Could not register hotkeys %s", hotkeys, exc_info=True)
-            self.unregister_hotkeys()
-            try:
-                for name, hotkey in old.items():
-                    self.add_hotkey(name, hotkey)
-            except (ValueError, KeyError):
-                pass
+        """Register {config key: hotkey}; on failure the previous hotkeys stay active, the reason is in
+        self.hotkey_error and False is returned."""
+        self.hotkey_error = self.hotkey_manager.set(hotkeys)
+        if self.hotkey_error:
             return False
         self.config.update(hotkeys)
         if self.tray_icon:
             self.tray_icon.title = self.tray_title()
         return True
 
-    def add_hotkey(self, name, hotkey):
-        self.hotkey_handles[name] = keyboard.add_hotkey(hotkey, self.hotkey_callbacks[name], suppress=False)
-        self.hotkey_codes[name] = {code for step in keyboard.parse_hotkey(hotkey) for key in step for code in key}
+    def suspend_hotkeys(self):
+        # Registered hotkeys swallow their key presses, so they must be off while a new one is recorded.
+        self.hotkey_manager.set({})
 
-    def unregister_hotkeys(self):
-        for handle in self.hotkey_handles.values():
-            try:
-                keyboard.remove_hotkey(handle)
-            except KeyError:
-                pass
-        self.hotkey_handles.clear()
-        self.hotkey_codes.clear()
+    def resume_hotkeys(self):
+        self.hotkey_manager.set({name: self.config.get(name, default) for name, default in DEFAULT_HOTKEYS.items()})
 
     def first_run_check(self):
         if not self.config.get("api_key"):
             self.show_settings()
 
     def on_hotkey(self):
-        # Runs on the keyboard listener thread; keep it short so key state keeps updating.
+        # Runs on the hotkey thread; keep it short so further hotkey messages are not delayed.
         if self.paused or self.recording_hotkey or self.is_capturing:
             return
         self.is_capturing = True
@@ -723,16 +834,19 @@ class TranslatorApp:
     def copy_selection_worker(self):
         try:
             # Wait until the hotkey is released, otherwise the target app would see e.g. Ctrl+Alt+C.
-            codes = self.hotkey_codes.get("hotkey", set())
+            try:
+                held = parse_hotkey(self.config.get("hotkey", DEFAULT_HOTKEYS["hotkey"]))[2]
+            except ValueError:
+                held = []
             deadline = time.monotonic() + HOTKEY_RELEASE_TIMEOUT
-            while time.monotonic() < deadline and any(keyboard.is_pressed(code) for code in codes):
+            while time.monotonic() < deadline and any(key_down(vk) for vk in held):
                 time.sleep(0.01)
             # Save what the user had copied, so it can be put back after reading the selection.
             backup = backup_clipboard(self.clipboard_hwnd)
             if backup is None:
                 logging.warning("Clipboard could not be backed up; it will not be restored")
             before = get_clipboard_sequence()
-            keyboard.send("ctrl+c")
+            send_ctrl_c()
             deadline = time.monotonic() + CLIPBOARD_UPDATE_TIMEOUT
             while get_clipboard_sequence() == before:
                 if time.monotonic() >= deadline:
@@ -1437,7 +1551,7 @@ class TranslatorApp:
         option_row(general_card, "开机自动启动", "登录 Windows 后自动在后台运行",
                    lambda parent: toggle(parent, autostart_var))
 
-        # 快捷键: modifier checkboxes plus one main key, so the result is always a valid keyboard-library name.
+        # 快捷键: recorded as modifiers plus one main key, so the result always parses with parse_hotkey.
         page = nav_item("快捷键", "")
         def hotkey_recorder(parent, variable):
             """A key box: click it, then press a key combination to record it into `variable`."""
@@ -1451,15 +1565,20 @@ class TranslatorApp:
                 box.configure(text=text or hotkey_label(variable.get()).replace("+", " + "), fg=color)
 
             def stop(_event=None):
-                recording["on"] = False
-                self.recording_hotkey = False
+                if recording["on"]:
+                    recording["on"] = False
+                    self.recording_hotkey = False
+                    self.resume_hotkeys()
                 box.configure(bg=idle_bg)
                 show()
 
             def start(_event=None):
-                recording["on"] = True
-                # Global hotkeys are ignored while recording, so pressing the current one does not translate.
-                self.recording_hotkey = True
+                if not recording["on"]:
+                    recording["on"] = True
+                    # Global hotkeys are released while recording, so the window receives the key presses
+                    # and pressing the current hotkey does not translate.
+                    self.recording_hotkey = True
+                    self.suspend_hotkeys()
                 error_label.configure(text="")
                 box.configure(bg=recording_bg)
                 box.focus_set()
@@ -1468,8 +1587,8 @@ class TranslatorApp:
             def on_key(event):
                 if not recording["on"]:
                     return None
-                # Read modifiers from the global keyboard hook, which also sees the Win key.
-                modifiers = [name for name in HOTKEY_MODIFIERS if keyboard.is_pressed(name)]
+                # Read modifiers from the system key state, which also sees the Win key.
+                modifiers = pressed_modifiers()
                 if event.keycode in MODIFIER_VK_CODES:
                     show(" + ".join(hotkey_label(name) for name in modifiers) + " + …", accent)
                 elif event.keycode == 27 and not modifiers:  # Esc cancels.
@@ -1555,7 +1674,9 @@ class TranslatorApp:
                                justify="left", anchor="w", wraplength=self.s(360))
 
         def close():
-            self.recording_hotkey = False
+            if self.recording_hotkey:
+                self.recording_hotkey = False
+                self.resume_hotkeys()
             win.destroy()
             self.settings_usage_label = None
 
@@ -1575,8 +1696,7 @@ class TranslatorApp:
                 return
             if not self.apply_hotkeys(hotkeys):
                 select_page("快捷键")
-                labels = "、".join(hotkey_label(hotkey) for hotkey in hotkeys.values())
-                error_label.configure(text=f"无法注册快捷键 {labels}，请换一个组合。")
+                error_label.configure(text=f"无法注册快捷键：{self.hotkey_error}，请换一个组合。")
                 return
             try:
                 set_autostart(autostart_var.get())
@@ -1653,7 +1773,7 @@ class TranslatorApp:
 
     def quit_app(self, icon=None, item=None):
         try:
-            keyboard.unhook_all()
+            self.hotkey_manager.stop()
         except Exception:
             pass
         if self.tray_icon:

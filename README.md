@@ -3,12 +3,26 @@
 <h1 align="center">Own翻译</h1>
 
 <p align="center">Windows 上的划词翻译工具：在任意软件中选中文字，按 <code>Ctrl+Alt+1</code>，译文就出现在屏幕右下角；图片里的文字可以按 <code>Ctrl+Alt+3</code> 截图翻译。<br>
-支持中文 / 日本語 / English 互译，翻译服务由<a href="https://niutrans.com/">小牛翻译</a>提供。</p>
+支持中文 / 日本語 / English 互译，翻译服务由<a href="https://niutrans.com/">小牛翻译</a>提供（需要填入你自己的小牛翻译 API Key，见<a href="#获取小牛翻译-api-key">下文</a>）。</p>
+
+<p align="center">
+  <b>下载</b>：<a href="https://gitee.com/zhang-bantao/OwnTransQuick/releases">Gitee（国内推荐）</a> · <a href="https://github.com/zhangzht-lab/OwnTransQuick/releases/latest">GitHub</a>
+  ｜ <a href="#下载与使用">使用说明</a>
+  ｜ 问题反馈：<a href="https://gitee.com/zhang-bantao/OwnTransQuick/issues">Gitee</a> · <a href="https://github.com/zhangzht-lab/OwnTransQuick/issues">GitHub</a>
+</p>
 
 <p align="center">
   <img src="docs/images/popup-light.png" width="420" alt="翻译窗口（浅色）">
   <img src="docs/images/popup-dark.png" width="420" alt="翻译窗口（深色）">
 </p>
+
+## 适合这些场景
+
+- **看日文资料**：选中即译，日文和英文默认译成中文；译成日文时，下面还会显示整句的假名读音。
+- **在 IDE、浏览器、聊天软件里遇到外文**：不用切到浏览器打开翻译网站，按快捷键就出结果，翻译完剪贴板也会恢复原样。
+- **写日文邮件、回复**：先用中文写好，选中后按快捷键（中文默认译成日文），点“替换原文”直接换成译文。
+- **图片、软件界面里选不中的文字**：截图翻译，译文直接盖在原来的位置上，排版不乱。
+- **只想要一个小工具**：单个 exe，解压即用，不用安装 Python，常驻托盘。
 
 ## 功能
 
@@ -30,7 +44,7 @@
 
 ## 下载与使用
 
-1. 到 [Releases](../../releases/latest) 下载 `OwnTranslation-vX.Y.Z-win64.zip`，解压后得到 `Own翻译.exe`。不需要安装，也不需要 Python。
+1. 到 [Gitee 发行版](https://gitee.com/zhang-bantao/OwnTransQuick/releases)（国内下载快）或 [GitHub Releases](https://github.com/zhangzht-lab/OwnTransQuick/releases/latest) 下载 `OwnTranslation-vX.Y.Z-win64.zip`，解压后得到 `Own翻译.exe`。不需要安装，也不需要 Python。
 2. 双击运行。首次运行会打开设置页，填入你的小牛翻译 API Key（见下文），可以点“测试 API Key”确认能用。
 3. 在任意软件中选中文字，按 `Ctrl+Alt+1`。
 
